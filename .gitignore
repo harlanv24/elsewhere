@@ -2,4 +2,6 @@
 __pycache__/
 *.py[cod]
 data/campaign.json
+data/state.json
+data/debug/
 data/nonexistent-*.json

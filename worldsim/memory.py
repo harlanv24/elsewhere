@@ -100,11 +100,11 @@ class CampaignMemory:
                 score += 2
             scored.append((score, entry))
         scored.sort(key=lambda item: (item[0], item[1].last_tick), reverse=True)
-        return [entry.summary for _, entry in scored[:limit]]
+        return [self._compact_summary(entry.summary) for _, entry in scored[:limit]]
 
     def latest_lines(self, limit: int = 4) -> list[str]:
         recent = sorted(self.entries.values(), key=lambda entry: (entry.last_tick, entry.importance), reverse=True)
-        return [entry.summary for entry in recent[:limit]]
+        return [self._compact_summary(entry.summary) for entry in recent[:limit]]
 
     def to_dict(self) -> dict[str, object]:
         return {"entries": [asdict(entry) for entry in self.entries.values()]}
@@ -125,10 +125,17 @@ class CampaignMemory:
         )
         self.entries = dict(ranked[:limit])
 
+    def _compact_summary(self, summary: str, max_length: int = 240) -> str:
+        normalized = " ".join(summary.split())
+        if len(normalized) <= max_length:
+            return normalized
+        return normalized[: max_length - 3].rstrip() + "..."
+
 
 class CampaignStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.state_path = path.parent / "state.json"
 
     def load(self) -> tuple[World, Player, CampaignMemory] | None:
         if not self.path.exists():
@@ -147,6 +154,7 @@ class CampaignStore:
             "memory": memory.to_dict(),
         }
         self.path.write_text(json.dumps(payload, indent=2))
+        self.state_path.write_text(json.dumps(self._serialize_state(world, player, memory), indent=2))
 
     def _serialize_world(self, world: World) -> dict[str, object]:
         return {
@@ -169,6 +177,10 @@ class CampaignStore:
             "recent_events": [asdict(event) for event in world.recent_events],
             "quest_hooks": list(world.quest_hooks),
             "alerts": list(world.alerts),
+            "conversations": {key: list(lines) for key, lines in world.conversations.items()},
+            "scene_objects": {key: list(items) for key, items in world.scene_objects.items()},
+            "object_states": world.object_states,
+            "state_facts": list(world.state_facts),
             "weather": world.weather,
             "stability": world.stability,
         }
@@ -198,9 +210,38 @@ class CampaignStore:
             recent_events=recent_events,
             quest_hooks=list(payload["quest_hooks"]),
             alerts=list(payload["alerts"]),
+            conversations={
+                key: list(lines)
+                for key, lines in payload.get("conversations", {}).items()
+                if isinstance(lines, list)
+            },
+            scene_objects={
+                key: list(items)
+                for key, items in payload.get("scene_objects", {}).items()
+                if isinstance(items, list)
+            },
+            object_states={
+                key: value
+                for key, value in payload.get("object_states", {}).items()
+                if isinstance(value, dict)
+            },
+            state_facts=list(payload.get("state_facts", [])),
             weather=payload["weather"],
             stability=payload["stability"],
         )
+
+    def _serialize_state(self, world: World, player: Player, memory: CampaignMemory) -> dict[str, object]:
+        position_key = f"{player.position.x},{player.position.y}"
+        return {
+            "tick": world.tick,
+            "player": self._serialize_player(player),
+            "current_position": position_key,
+            "visible_scene_objects": list(world.scene_objects.get(position_key, [])),
+            "object_states": world.object_states,
+            "conversations": {key: lines[-12:] for key, lines in world.conversations.items()},
+            "recent_state_facts": world.state_facts[-24:],
+            "memory": memory.latest_lines(limit=12),
+        }
 
     def _serialize_player(self, player: Player) -> dict[str, object]:
         return {

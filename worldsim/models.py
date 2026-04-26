@@ -76,6 +76,9 @@ class DirectorBeat:
     difficulty: int = 10
     tags: list[str] = field(default_factory=list)
     follow_up_hook: str | None = None
+    scene_objects: list[str] = field(default_factory=list)
+    inventory_add: list[str] = field(default_factory=list)
+    inventory_remove: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -90,6 +93,10 @@ class World:
     recent_events: list[Event] = field(default_factory=list)
     quest_hooks: list[str] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
+    conversations: dict[str, list[str]] = field(default_factory=dict)
+    scene_objects: dict[str, list[str]] = field(default_factory=dict)
+    object_states: dict[str, dict[str, object]] = field(default_factory=dict)
+    state_facts: list[str] = field(default_factory=list)
     weather: str = "Clear"
     stability: int = 70
 

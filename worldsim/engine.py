@@ -5,15 +5,15 @@ import random
 
 from worldsim.director import Director
 from worldsim.memory import CampaignMemory
-from worldsim.models import Biome, CommandResult, Event, Location, Npc, Player, Position, World
+from worldsim.models import Biome, CommandResult, DirectorBeat, Event, Location, Npc, Player, Position, World
 
 
 class WorldEngine:
-    def __init__(self, seed: int = 732451) -> None:
+    def __init__(self, seed: int = 696969) -> None:
         self.seed = seed
         self.random = random.Random(seed)
 
-    def create_world(self) -> World:
+    def create_world(self, director: Director | None = None) -> World:
         width = 96
         height = 52
         tiles = self._generate_tiles(width, height)
@@ -32,6 +32,8 @@ class WorldEngine:
         )
         self._add_event(world, "world", "The frontier wakes under a restless sky.")
         world.quest_hooks = self._starting_hooks(locations)
+        if director is not None:
+            self._apply_world_details(world, director.generate_world_details(world))
         self._refresh_alerts(world, None)
         return world
 
@@ -68,7 +70,7 @@ class WorldEngine:
 
         if text == "help":
             return CommandResult(
-                "Commands: north south east west, look, explore, talk, attack, rest, wait, help, quit."
+                "Commands: north south east west, look, explore, talk, say <message>, attack, rest, wait, help, quit. You can also type actions like `take journal`."
             )
 
         if text in {"north", "south", "east", "west", "n", "s", "e", "w"} or text.startswith("move "):
@@ -103,6 +105,7 @@ class WorldEngine:
 
         if text == "explore":
             beat = director.respond_to_action(world, player, "explore", location, npc, memory_context)
+            self._remember_scene_objects(world, player.position, beat.scene_objects)
             success = self._roll_check(player, beat.difficulty)
             place = location.name if location else "the wilds"
             if success:
@@ -145,6 +148,7 @@ class WorldEngine:
 
         if text == "talk":
             beat = director.respond_to_action(world, player, "talk", location, npc, memory_context)
+            self._remember_scene_objects(world, player.position, beat.scene_objects)
             if npc is None:
                 message = beat.narration
             else:
@@ -162,12 +166,47 @@ class WorldEngine:
                     tags=[npc.name, npc.location_name, "rumor"],
                 )
                 message = beat.narration
+                self._remember_dialogue(world, npc, f"{npc.name}: {beat.narration}")
             self._advance_world(world, player, director, memory, "talk")
             memory.remember_world_state(world, player)
             return CommandResult(message, advance_time=True)
 
+        if text.startswith("say "):
+            player_dialogue = command.strip()[4:].strip()
+            if not player_dialogue:
+                return CommandResult("Say what?")
+            if npc is None:
+                return CommandResult("There is no one here to answer.")
+            history = self._dialogue_history(world, npc)
+            reply = director.respond_to_dialogue(
+                world,
+                player,
+                player_dialogue,
+                location,
+                npc,
+                memory_context,
+                history,
+            )
+            self._remember_dialogue(world, npc, f"{player.name}: {player_dialogue}")
+            self._remember_dialogue(world, npc, f"{npc.name}: {reply}")
+            self._remember_state_fact(world, f"{player.name} told {npc.name}: {player_dialogue}", world.tick)
+            self._remember_state_fact(world, f"{npc.name} replied to {player.name}: {reply}", world.tick)
+            memory.remember_npc(npc, world.tick)
+            memory.remember(
+                "dialogue",
+                f"{npc.name}:{world.tick}",
+                f"{player.name} spoke with {npc.name}: {player_dialogue} / {reply}",
+                world.tick,
+                importance=7,
+                tags=[npc.name, npc.location_name, "dialogue"],
+            )
+            self._advance_world(world, player, director, memory, "talk")
+            memory.remember_world_state(world, player)
+            return CommandResult(reply, advance_time=True)
+
         if text == "rest":
             beat = director.respond_to_action(world, player, "rest", location, npc, memory_context)
+            self._remember_scene_objects(world, player.position, beat.scene_objects)
             heal = self.random.randint(2, 5)
             player.hp = min(player.max_hp, player.hp + heal)
             self._advance_world(world, player, director, memory, "rest")
@@ -184,6 +223,7 @@ class WorldEngine:
 
         if text == "attack":
             beat = director.respond_to_action(world, player, "attack", location, npc, memory_context)
+            self._remember_scene_objects(world, player.position, beat.scene_objects)
             if location is None:
                 self._advance_world(world, player, director, memory, "attack")
                 memory.remember_world_state(world, player)
@@ -234,7 +274,7 @@ class WorldEngine:
             memory.remember_world_state(world, player)
             return CommandResult("You keep still long enough to notice the world changing around you.", advance_time=True)
 
-        return CommandResult("Unknown command. Type `help`.")
+        return self._resolve_freeform_action(command.strip(), world, player, director, memory, location, npc, memory_context)
 
     def location_at(self, world: World, position: Position) -> Location | None:
         for location in world.locations:
@@ -266,6 +306,264 @@ class WorldEngine:
             "events": len(world.recent_events),
             "hooks": len(world.quest_hooks),
         }
+
+    def scene_objects_at(self, world: World, position: Position) -> list[str]:
+        return list(world.scene_objects.get(self._position_key(position), []))
+
+    def _resolve_freeform_action(
+        self,
+        action: str,
+        world: World,
+        player: Player,
+        director: Director,
+        memory: CampaignMemory,
+        location: Location | None,
+        npc: Npc | None,
+        memory_context: list[str],
+    ) -> CommandResult:
+        if not action:
+            return CommandResult("Type a command. Try `help` if you want the list.")
+        visible_items = self.scene_objects_at(world, player.position)
+        unavailable = self._unavailable_target_message(action, world, player.position, visible_items, player.inventory)
+        if unavailable is not None:
+            return CommandResult(unavailable)
+        beat = director.respond_to_freeform_action(world, player, action, location, npc, memory_context)
+        self._remember_scene_objects(world, player.position, beat.scene_objects)
+        visible_items = self.scene_objects_at(world, player.position)
+        added = self._apply_inventory_changes(player, world, action, beat, visible_items)
+        removed_scene_items = self._apply_scene_object_action(world, player.position, action, visible_items)
+        place = location.name if location else "the wilds"
+        outcome_parts = [f"attempted `{action}`"]
+        if beat.tags:
+            outcome_parts.append(f"tags: {', '.join(beat.tags[:4])}")
+        if added:
+            outcome_parts.append(f"took: {', '.join(added)}")
+        if removed_scene_items:
+            outcome_parts.append(f"changed/removed: {', '.join(removed_scene_items)}")
+        if beat.follow_up_hook:
+            outcome_parts.append(f"hook: {beat.follow_up_hook}")
+        self._remember_state_fact(world, f"{player.name} near {place}: {'; '.join(outcome_parts)}.", world.tick)
+        memory.remember(
+            "action",
+            f"{player.name}:{world.tick}:{action}",
+            f"{player.name} near {place}: {'; '.join(outcome_parts)}.",
+            world.tick,
+            importance=6,
+            tags=[player.name, place, "action"],
+        )
+        self._advance_world(world, player, director, memory, "freeform")
+        memory.remember_world_state(world, player)
+        suffix_parts = []
+        if added:
+            suffix_parts.append(f"Added to inventory: {', '.join(added)}.")
+        if removed_scene_items:
+            suffix_parts.append(f"Scene changed: {', '.join(removed_scene_items)}.")
+        suffix = f" {' '.join(suffix_parts)}" if suffix_parts else ""
+        return CommandResult(f"{beat.narration}{suffix}", advance_time=True)
+
+    def _apply_inventory_changes(
+        self,
+        player: Player,
+        world: World,
+        action: str,
+        beat: DirectorBeat,
+        visible_items: list[str],
+    ) -> list[str]:
+        requested_item = self._requested_take_item(action)
+        proposed_adds = list(beat.inventory_add)
+        if requested_item and self._matches_known_object(requested_item, visible_items):
+            proposed_adds.insert(0, requested_item)
+        added: list[str] = []
+        for item in proposed_adds:
+            normalized = self._clean_item_name(item)
+            if not normalized or normalized in player.inventory:
+                continue
+            if not requested_item or not self._matches_known_object(normalized, visible_items + [requested_item]):
+                continue
+            player.inventory.append(normalized)
+            added.append(normalized)
+            self._set_object_state(
+                world,
+                player.position,
+                normalized,
+                status="in_inventory",
+                tick=world.tick,
+                owner=player.name,
+            )
+            self._remove_scene_object(world, player.position, normalized)
+        for item in beat.inventory_remove:
+            normalized = self._clean_item_name(item)
+            if normalized in player.inventory:
+                player.inventory.remove(normalized)
+        return added
+
+    def _requested_take_item(self, action: str) -> str | None:
+        words = action.strip().split(maxsplit=1)
+        if len(words) != 2 or words[0].lower() not in {"take", "get", "grab", "pick"}:
+            return None
+        item = words[1]
+        if item.lower().startswith("up "):
+            item = item[3:]
+        return self._clean_item_name(item)
+
+    def _targeted_object_action(self, action: str) -> tuple[str, str] | None:
+        words = action.strip().split(maxsplit=1)
+        if len(words) != 2:
+            return None
+        verb = words[0].lower()
+        if verb == "pick" and words[1].lower().startswith("up "):
+            return "take", self._clean_item_name(words[1][3:])
+        if verb not in {
+            "take",
+            "get",
+            "grab",
+            "burn",
+            "destroy",
+            "break",
+            "tear",
+            "shatter",
+            "discard",
+            "read",
+            "open",
+            "close",
+            "move",
+            "push",
+            "pull",
+            "use",
+        }:
+            return None
+        return verb, self._clean_item_name(words[1])
+
+    def _unavailable_target_message(
+        self,
+        action: str,
+        world: World,
+        position: Position,
+        visible_items: list[str],
+        inventory: list[str],
+    ) -> str | None:
+        target = self._targeted_object_action(action)
+        if target is None:
+            return None
+        verb, item = target
+        if not item:
+            return None
+        if verb in {"take", "get", "grab"} and self._matches_known_object(item, inventory):
+            return f"You already have {item}."
+        state = self._object_state_for_target(world, position, item)
+        if state is not None and state.get("status") in {"destroyed", "removed", "in_inventory"}:
+            status = state.get("status")
+            if status == "in_inventory":
+                return f"You already have {item}."
+            return f"The {item} is already {status}."
+        if self._matches_known_object(item, visible_items) or self._matches_known_object(item, inventory):
+            return None
+        return f"There is no {item} here to {verb}."
+
+    def _object_state_for_target(self, world: World, position: Position, item: str) -> dict[str, object] | None:
+        target = self._clean_item_name(item)
+        position_key = self._position_key(position)
+        for record in world.object_states.values():
+            name = str(record.get("name", "")).lower()
+            if record.get("last_position") != position_key and record.get("position") != position_key:
+                continue
+            if target == name or target in name or name in target:
+                return record
+        return None
+
+    def _matches_known_object(self, item: str, objects: list[str]) -> bool:
+        item_key = item.lower()
+        return any(item_key == obj.lower() or item_key in obj.lower() or obj.lower() in item_key for obj in objects)
+
+    def _remember_scene_objects(self, world: World, position: Position, objects: list[str]) -> None:
+        cleaned = [self._clean_item_name(item) for item in objects]
+        cleaned = [item for item in cleaned if item]
+        if not cleaned:
+            return
+        key = self._position_key(position)
+        existing = world.scene_objects.setdefault(key, [])
+        for item in cleaned:
+            if item not in existing:
+                existing.append(item)
+        del existing[12:]
+
+    def _remove_scene_object(self, world: World, position: Position, item: str) -> None:
+        key = self._position_key(position)
+        objects = world.scene_objects.get(key)
+        if not objects:
+            return
+        item_key = item.lower()
+        world.scene_objects[key] = [
+            obj
+            for obj in objects
+            if obj.lower() != item_key and item_key not in obj.lower() and obj.lower() not in item_key
+        ]
+
+    def _apply_scene_object_action(self, world: World, position: Position, action: str, visible_items: list[str]) -> list[str]:
+        words = action.strip().split(maxsplit=1)
+        if len(words) != 2 or words[0].lower() not in {"burn", "destroy", "break", "tear", "shatter", "discard"}:
+            return []
+        target = self._clean_item_name(words[1])
+        if not target or not self._matches_known_object(target, visible_items):
+            return []
+        removed = [item for item in visible_items if self._matches_known_object(target, [item])]
+        for item in removed:
+            self._set_object_state(world, position, item, status="destroyed", tick=world.tick)
+        self._remove_scene_object(world, position, target)
+        return removed
+
+    def _position_key(self, position: Position) -> str:
+        return f"{position.x},{position.y}"
+
+    def _clean_item_name(self, item: str) -> str:
+        return item.strip().lower().removeprefix("the ").removeprefix("a ").removeprefix("an ")[:60]
+
+    def _object_state_key(self, position: Position, item: str) -> str:
+        return f"{self._position_key(position)}:{self._clean_item_name(item)}"
+
+    def _set_object_state(
+        self,
+        world: World,
+        position: Position,
+        item: str,
+        status: str,
+        tick: int,
+        owner: str | None = None,
+    ) -> None:
+        cleaned = self._clean_item_name(item)
+        if not cleaned:
+            return
+        key = self._object_state_key(position, cleaned)
+        record = world.object_states.setdefault(
+            key,
+            {
+                "name": cleaned,
+                "position": self._position_key(position),
+                "created_tick": tick,
+            },
+        )
+        record["status"] = status
+        record["last_tick"] = tick
+        record["last_position"] = self._position_key(position)
+        if owner is not None:
+            record["owner"] = owner
+        self._remember_state_fact(world, f"{cleaned} at {self._position_key(position)} is now {status}.", tick)
+
+    def _remember_state_fact(self, world: World, fact: str, tick: int, limit: int = 80) -> None:
+        normalized = " ".join(fact.split())
+        if len(normalized) > 240:
+            normalized = normalized[:237].rstrip() + "..."
+        line = f"[tick {tick}] {normalized}"
+        world.state_facts.append(line)
+        del world.state_facts[:-limit]
+
+    def _dialogue_history(self, world: World, npc: Npc, limit: int = 8) -> list[str]:
+        return world.conversations.get(npc.name, [])[-limit:]
+
+    def _remember_dialogue(self, world: World, npc: Npc, line: str, limit: int = 16) -> None:
+        history = world.conversations.setdefault(npc.name, [])
+        history.append(line)
+        del history[:-limit]
 
     def _move_player(self, direction: str, world: World, player: Player) -> CommandResult:
         offsets = {"north": (0, -1), "south": (0, 1), "east": (1, 0), "west": (-1, 0)}
@@ -326,6 +624,61 @@ class WorldEngine:
         if world.stability < 50:
             alerts.append("World stability is slipping")
         world.alerts = alerts[:3]
+
+    def _apply_world_details(self, world: World, details: dict[str, object] | None) -> None:
+        if not details:
+            return
+        weather = details.get("weather")
+        if isinstance(weather, str) and weather.strip():
+            world.weather = weather.strip()[:80]
+
+        old_names = [location.name for location in world.locations]
+        renamed_locations: dict[str, str] = {}
+        for update in details.get("locations", []):
+            if not isinstance(update, dict):
+                continue
+            index = update.get("index")
+            if not isinstance(index, int) or not 0 <= index < len(world.locations):
+                continue
+            location = world.locations[index]
+            old_name = location.name
+            name = update.get("name")
+            summary = update.get("summary")
+            if isinstance(name, str) and name.strip():
+                location.name = name.strip()[:40]
+                renamed_locations[old_name] = location.name
+            if isinstance(summary, str) and summary.strip():
+                location.summary = summary.strip()[:160]
+
+        for npc in world.npcs:
+            if npc.location_name in renamed_locations:
+                npc.location_name = renamed_locations[npc.location_name]
+
+        for update in details.get("npcs", []):
+            if not isinstance(update, dict):
+                continue
+            index = update.get("index")
+            if not isinstance(index, int) or not 0 <= index < len(world.npcs):
+                continue
+            npc = world.npcs[index]
+            for field_name in ("name", "role", "disposition", "location_name"):
+                value = update.get(field_name)
+                if isinstance(value, str) and value.strip():
+                    setattr(npc, field_name, value.strip()[:40])
+
+        valid_location_names = {location.name for location in world.locations}
+        for npc in world.npcs:
+            if npc.location_name not in valid_location_names and old_names:
+                fallback_name = renamed_locations.get(old_names[min(world.npcs.index(npc), len(old_names) - 1)])
+                npc.location_name = fallback_name or world.locations[0].name
+
+        hooks = [hook.strip() for hook in details.get("quest_hooks", []) if isinstance(hook, str) and hook.strip()]
+        if hooks:
+            world.quest_hooks = hooks[:6]
+
+        opening_event = details.get("opening_event")
+        if isinstance(opening_event, str) and opening_event.strip():
+            self._add_event(world, "world", opening_event.strip()[:180])
 
     def _add_event(self, world: World, category: str, text: str, severity: str = "info") -> None:
         world.recent_events.insert(0, Event(tick=world.tick, category=category, text=text, severity=severity))

@@ -17,10 +17,59 @@ TEXT_RESPONSE_SCHEMA: dict[str, object] = {
 
 WORLD_DETAILS_SCHEMA: dict[str, object] = {
     "type": "object",
-    "required": ["weather", "opening_event", "locations", "npcs", "quest_hooks"],
+    "required": [
+        "campaign_title",
+        "overarching_quest",
+        "weather",
+        "opening_event",
+        "locations",
+        "npcs",
+        "quest_hooks",
+        "player_archetypes",
+        "homelands",
+    ],
     "properties": {
+        "campaign_title": {"type": "string"},
+        "overarching_quest": {"type": "string"},
         "weather": {"type": "string"},
         "opening_event": {"type": "string"},
+        "player_archetypes": {
+            "type": "array",
+            "minItems": 5,
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "required": ["name", "description", "skill_bonuses"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "skill_bonuses": {
+                        "type": "array",
+                        "minItems": 5,
+                        "maxItems": 7,
+                        "items": {
+                            "type": "object",
+                            "required": ["skill", "bonus"],
+                            "properties": {
+                                "skill": {"type": "string"},
+                                "bonus": {"type": "integer", "minimum": 1, "maximum": 3},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                    "boosts": {
+                        "type": "object",
+                        "properties": {
+                            "exploration_check": {"type": "integer", "minimum": 0, "maximum": 3},
+                            "social_check": {"type": "integer", "minimum": 0, "maximum": 3},
+                            "combat_check": {"type": "integer", "minimum": 0, "maximum": 3},
+                        },
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        "homelands": {"type": "array", "items": {"type": "string"}, "minItems": 5, "maxItems": 8},
         "locations": {
             "type": "array",
             "items": {
@@ -70,6 +119,7 @@ DIRECTOR_BEAT_SCHEMA: dict[str, object] = {
         "scene_objects": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
         "inventory_add": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
         "inventory_remove": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+        "choices": {"type": "array", "items": {"type": "string"}, "minItems": 0, "maxItems": 4},
     },
     "additionalProperties": False,
 }
@@ -90,6 +140,9 @@ def director_context(
         "world": {
             "seed": world.seed,
             "tick": world.tick,
+            "theme_prompt": world.theme_prompt,
+            "campaign_title": world.campaign_title,
+            "overarching_quest": world.overarching_quest,
             "weather": world.weather,
             "stability": world.stability,
             "map_size": {"width": world.width, "height": world.height},
@@ -124,6 +177,11 @@ def director_context(
                 }
                 for event in world.recent_events[:5]
             ],
+            "active_quest": world.active_quest,
+            "current_activity": world.current_activity,
+            "movement_lock": world.movement_lock,
+            "current_choices": world.current_choices,
+            "last_roll": world.last_roll,
         },
         "player": _player_payload(player) if player is not None else None,
         "location": _location_payload(location) if location is not None else None,
@@ -135,6 +193,7 @@ def director_context(
             "visible_scene_objects": _scene_objects_at(world, player) if player is not None else [],
             "object_states_here": _object_states_for_position(world, position_key),
             "player_inventory": list(player.inventory) if player is not None else [],
+            "player_boosts": dict(player.boosts) if player is not None else {},
             "recent_state_facts": _compact_lines(world.state_facts[-12:], 180),
             "npc_conversation_history": _compact_lines(world.conversations.get(npc.name, [])[-10:], 180)
             if npc is not None
@@ -157,11 +216,17 @@ def text_from_payload(payload: dict[str, object]) -> str:
 
 def world_details_from_payload(payload: dict[str, object]) -> dict[str, object]:
     details: dict[str, object] = {
+        "campaign_title": _optional_string(payload, "campaign_title"),
+        "overarching_quest": _optional_string(payload, "overarching_quest"),
         "weather": _optional_string(payload, "weather"),
         "opening_event": _optional_string(payload, "opening_event"),
         "locations": [],
         "npcs": [],
         "quest_hooks": [],
+        "player_archetypes": [],
+        "player_archetype_blurbs": {},
+        "player_archetype_boosts": {},
+        "homelands": [],
     }
     for raw_location in payload.get("locations", []):
         if not isinstance(raw_location, dict) or not isinstance(raw_location.get("index"), int):
@@ -191,6 +256,36 @@ def world_details_from_payload(payload: dict[str, object]) -> dict[str, object]:
             )
     hooks = [hook.strip() for hook in payload.get("quest_hooks", []) if isinstance(hook, str) and hook.strip()]
     details["quest_hooks"] = hooks[:6]
+    archetypes: list[str] = []
+    blurbs: dict[str, str] = {}
+    boosts_by_archetype: dict[str, dict[str, int]] = {}
+    for raw_archetype in payload.get("player_archetypes", []):
+        if isinstance(raw_archetype, str):
+            name = raw_archetype.strip().lower()
+            description = ""
+            boosts = {}
+        elif isinstance(raw_archetype, dict):
+            raw_name = raw_archetype.get("name")
+            name = raw_name.strip().lower() if isinstance(raw_name, str) else ""
+            raw_description = raw_archetype.get("description")
+            description = raw_description.strip() if isinstance(raw_description, str) else ""
+            boosts = _skill_bonuses(raw_archetype.get("skill_bonuses"))
+            if not boosts:
+                boosts = _check_boosts(raw_archetype.get("boosts"))
+        else:
+            continue
+        if not name:
+            continue
+        archetypes.append(name)
+        if description:
+            blurbs[name] = description[:180]
+        if boosts:
+            boosts_by_archetype[name] = boosts
+    homelands = [item.strip() for item in payload.get("homelands", []) if isinstance(item, str) and item.strip()]
+    details["player_archetypes"] = archetypes[:6]
+    details["player_archetype_blurbs"] = {key: blurbs[key] for key in archetypes[:6] if key in blurbs}
+    details["player_archetype_boosts"] = {key: boosts_by_archetype[key] for key in archetypes[:6] if key in boosts_by_archetype}
+    details["homelands"] = homelands[:8]
     return details
 
 
@@ -215,6 +310,7 @@ def director_beat_from_payload(payload: dict[str, object]) -> DirectorBeat:
         scene_objects=_string_list(payload.get("scene_objects"), 8),
         inventory_add=_string_list(payload.get("inventory_add"), 4),
         inventory_remove=_string_list(payload.get("inventory_remove"), 4),
+        choices=_string_list(payload.get("choices"), 4),
     )
 
 
@@ -243,6 +339,7 @@ def _player_payload(player: Player) -> dict[str, object]:
         "xp": player.xp,
         "position": {"x": player.position.x, "y": player.position.y},
         "inventory": list(player.inventory),
+        "boosts": dict(player.boosts),
     }
 
 
@@ -292,6 +389,33 @@ def _string_list(value: object, limit: int) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item.strip()[:60] for item in value if isinstance(item, str) and item.strip()][:limit]
+
+
+def _check_boosts(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    boosts: dict[str, int] = {}
+    for key in ("exploration_check", "social_check", "combat_check"):
+        raw = value.get(key)
+        if isinstance(raw, int):
+            boosts[key] = max(0, min(3, raw))
+    return boosts
+
+
+def _skill_bonuses(value: object) -> dict[str, int]:
+    if not isinstance(value, list):
+        return {}
+    boosts: dict[str, int] = {}
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        skill = raw.get("skill")
+        bonus = raw.get("bonus")
+        if not isinstance(skill, str) or not skill.strip() or not isinstance(bonus, int):
+            continue
+        key = skill.strip().lower().replace(" ", "_").replace("-", "_")
+        boosts[key] = max(1, min(3, bonus))
+    return boosts
 
 
 def _compact_lines(lines: list[str], max_length: int) -> list[str]:

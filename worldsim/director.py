@@ -41,6 +41,7 @@ Return structured beats with:
 - difficulty
 - tags
 - follow_up_hook
+- choices
 """.strip()
 
 
@@ -300,7 +301,8 @@ class LocalLLMDirector(Director):
         config = self.client.config
         if self.last_error:
             return f"LLM director: fallback after {self.last_task or 'request'} failed ({self.last_error})"
-        return f"LLM director: {config.model} at {config.base_url}"
+        auth = "API key present" if config.api_key else "no API key"
+        return f"LLM director: {config.model} at {config.base_url} ({auth})"
 
     def introduce_world(self, world: World, player: Player, memory_context: list[str] | None = None) -> str:
         context = director_context(world, player=player, memory_context=memory_context)
@@ -445,7 +447,12 @@ class LocalLLMDirector(Director):
         }
         user = json.dumps(user_payload, indent=2)
         self._log("director_prompt", task=task, system=_llm_system_prompt(), user_payload=user_payload)
-        raw = self.client.complete_streaming(_llm_system_prompt(), user, self.on_stream_delta)
+        raw = self.client.complete_streaming(
+            _llm_system_prompt(),
+            user,
+            self.on_stream_delta,
+            response_schema=response_schema,
+        )
         self._log("director_raw_response", task=task, raw=raw)
         payload = parse_json_object(raw)
         self._log("director_parsed_response", task=task, payload=payload)
@@ -480,11 +487,32 @@ def _llm_system_prompt() -> str:
         "Read the JSON task and context from the user message. "
         "Return only one JSON object that matches response_schema. "
         "For generate_world_details, rewrite the provided indexed locations and NPCs while preserving their indexes. "
-        "Location names must be evocative fantasy place names, not the placeholders from context. "
-        "Quest hooks must be concrete unresolved adventure rumors. "
+        "Use context.theme_prompt as the creative brief for the whole campaign. "
+        "Create a campaign_title and overarching_quest that fit the theme_prompt and can sustain many sessions. "
+        "Create player_archetypes and homelands as concise playable character choices rooted in the generated world and theme_prompt. "
+        "Create five or six player_archetypes. "
+        "Each player_archetype needs a lower-case name, a one-sentence description, and five to seven skill_bonuses. "
+        "Skill names should be user-facing rollable skills such as tracking, stealth, courtly etiquette, spirit lore, archery, endurance, investigation, medicine, command, dueling, sailing, or ritual. "
+        "Descriptions should say what the class specializes in using those rollable skills. "
+        "Keep skill bonuses modest, 1 to 3, and make each class mechanically distinct. "
+        "Player archetype names should be lower-case class names suitable for mechanics, such as shrine warden, court spy, or storm sailor. "
+        "Create five to eight homelands. Homelands should be places, clans, settlements, orders, or regions that exist naturally in this campaign. "
+        "Treat provided biomes and coordinates as a neutral terrain scaffold; interpret each location through the theme_prompt rather than copying generic fantasy assumptions. "
+        "Location names must be evocative place names that fit the theme_prompt, not the placeholders from context. "
+        "Location summaries should make the world feel authored around the theme_prompt using culture, conflict, terrain, factions, landmarks, and mood. "
+        "Quest hooks must be concrete smaller quests that point toward, complicate, or reveal the overarching_quest. "
         "Keep generate_world_details compact: summaries and hooks should each be one sentence. "
         "For respond_to_dialogue, write only the NPC's in-character reply and make it respond directly to player_dialogue. "
-        "NPCs may ask one specific follow-up question when useful. "
+        "Do not reflexively end messages with a question. NPCs may ask follow-up questions when they create a meaningful choice, reveal character, or add new information. "
+        "Prolonged dialogue is appropriate when it has tension, discovery, negotiation, or relationship stakes; avoid stalling with repeated prompts when the scene should move to action. "
+        "Regularly move scenes toward concrete choices, visible risks, and actionable next steps. "
+        "Most action, exploration, and dialogue beats should include two to four short choices in the choices array. "
+        "Choices should be player actions, not questions, and should be specific enough to click directly. "
+        "The player may still type any open-ended action. "
+        "When a risky action should be uncertain, request a mechanical check using mechanical_request and difficulty; never decide the roll result yourself. "
+        "Use exploration_check for searching, tracking, traversal, lore clues, and environmental hazards. "
+        "Use social_check for persuasion, deception, intimidation, insight, and negotiation. "
+        "Use combat_check for violence, chases under threat, and direct physical danger. "
         "Use state_ledger.npc_conversation_history as authoritative conversation state; do not repeat a prior NPC answer unless the player asks for repetition. "
         "Never return text that closely matches state_ledger.npc_prior_replies. "
         "If the player changes topic, answer the new topic directly. "
@@ -509,9 +537,11 @@ def _llm_system_prompt() -> str:
 
 def _world_generation_context(world: World) -> dict[str, object]:
     return {
+        "theme_prompt": world.theme_prompt,
         "world": {
             "seed": world.seed,
             "tick": world.tick,
+            "theme_prompt": world.theme_prompt,
             "stability": world.stability,
             "map_size": {"width": world.width, "height": world.height},
             "locations": [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import secrets
 
 from worldsim.director import Director
 from worldsim.memory import CampaignMemory
@@ -9,13 +10,14 @@ from worldsim.models import Biome, CommandResult, DirectorBeat, Event, Location,
 
 
 class WorldEngine:
-    def __init__(self, seed: int = 696969) -> None:
-        self.seed = seed
-        self.random = random.Random(seed)
+    def __init__(self, seed: int | None = None) -> None:
+        self.seed = seed if seed is not None else secrets.randbelow(1_000_000_000)
+        self.random = random.Random(self.seed)
 
-    def create_world(self, director: Director | None = None) -> World:
+    def create_world(self, director: Director | None = None, theme_prompt: str | None = None) -> World:
         width = 96
         height = 52
+        theme = (theme_prompt or "grounded fantasy frontier").strip()[:500]
         tiles = self._generate_tiles(width, height)
         locations = self._generate_locations(tiles, width, height)
         npcs = self._generate_npcs(locations)
@@ -29,17 +31,20 @@ class WorldEngine:
             npcs=npcs,
             weather="Wind from the west",
             stability=68,
+            theme_prompt=theme,
         )
         self._add_event(world, "world", "The frontier wakes under a restless sky.")
         world.quest_hooks = self._starting_hooks(locations)
         if director is not None:
             self._apply_world_details(world, director.generate_world_details(world))
+        world.active_quest = world.quest_hooks[0] if world.quest_hooks else world.overarching_quest
         self._refresh_alerts(world, None)
         return world
 
     def create_player(self, world: World, name: str, archetype: str, homeland: str) -> Player:
         start = world.locations[0]
         max_hp = {"warrior": 18, "rogue": 14, "mage": 12, "ranger": 16}.get(archetype, 14)
+        boosts = dict(world.player_archetype_boosts.get(archetype, {}))
         return Player(
             name=name,
             archetype=archetype,
@@ -49,6 +54,7 @@ class WorldEngine:
             gold=12,
             xp=0,
             position=start.position,
+            boosts=boosts,
         )
 
     def resolve_command(
@@ -59,21 +65,36 @@ class WorldEngine:
         director: Director,
         memory: CampaignMemory,
     ) -> CommandResult:
-        text = command.strip().lower()
-        if text.startswith("/"):
-            text = text[1:].strip()
+        raw_command = command.strip()
+        if raw_command.startswith("/"):
+            raw_command = raw_command[1:].strip()
+        text = raw_command.lower()
         if not text:
             return CommandResult("Type a command. Try `help` if you want the list.")
 
         if text in {"quit", "exit"}:
             return CommandResult("The world will wait.", should_quit=True)
 
+        if text in {"flee", "retreat", "withdraw"}:
+            if world.movement_lock is None:
+                return CommandResult("There is nothing immediate holding you here.")
+            world.current_activity = None
+            world.movement_lock = None
+            world.current_choices = []
+            world.last_roll = None
+            self._remember_state_fact(world, f"{player.name} withdrew from the immediate situation.", world.tick)
+            return CommandResult("You break away from the immediate danger. The road is open again.")
+
         if text == "help":
             return CommandResult(
-                "Commands: north south east west, look, explore, talk, say <message>, attack, rest, wait, help, quit. You can also type actions like `take journal`."
+                "Commands: north south east west, look, explore, talk, say <message>, attack, rest, wait, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare text is dialogue and slash-prefixed text is a command, like /look."
             )
 
         if text in {"north", "south", "east", "west", "n", "s", "e", "w"} or text.startswith("move "):
+            if world.movement_lock is not None:
+                return CommandResult(
+                    f"You cannot travel while {world.movement_lock}. Resolve the situation, choose an option, or type `flee`."
+                )
             direction = text
             if text.startswith("move "):
                 direction = text.split(maxsplit=1)[1]
@@ -105,8 +126,9 @@ class WorldEngine:
 
         if text == "explore":
             beat = director.respond_to_action(world, player, "explore", location, npc, memory_context)
+            self._apply_beat_context(world, beat)
             self._remember_scene_objects(world, player.position, beat.scene_objects)
-            success = self._roll_check(player, beat.difficulty)
+            success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
             place = location.name if location else "the wilds"
             if success:
                 gain = self.random.randint(2, 6)
@@ -126,7 +148,7 @@ class WorldEngine:
                     importance=7,
                     tags=[place, "discovery"],
                 )
-                message = f"{beat.narration} You recover {gain} gold and useful leverage."
+                message = f"{beat.narration}\n\n{world.last_roll} You recover {gain} gold and useful leverage."
             else:
                 damage = self.random.randint(1, 4)
                 player.hp = max(0, player.hp - damage)
@@ -141,13 +163,14 @@ class WorldEngine:
                     importance=8,
                     tags=[place, "danger"],
                 )
-                message = f"{beat.narration} The search goes badly and you take {damage} damage."
+                message = f"{beat.narration}\n\n{world.last_roll} The search goes badly and you take {damage} damage."
             self._advance_world(world, player, director, memory, "explore")
             memory.remember_world_state(world, player)
             return CommandResult(message, advance_time=True)
 
         if text == "talk":
             beat = director.respond_to_action(world, player, "talk", location, npc, memory_context)
+            self._apply_beat_context(world, beat)
             self._remember_scene_objects(world, player.position, beat.scene_objects)
             if npc is None:
                 message = beat.narration
@@ -172,7 +195,7 @@ class WorldEngine:
             return CommandResult(message, advance_time=True)
 
         if text.startswith("say "):
-            player_dialogue = command.strip()[4:].strip()
+            player_dialogue = raw_command[4:].strip()
             if not player_dialogue:
                 return CommandResult("Say what?")
             if npc is None:
@@ -206,6 +229,7 @@ class WorldEngine:
 
         if text == "rest":
             beat = director.respond_to_action(world, player, "rest", location, npc, memory_context)
+            self._apply_beat_context(world, beat)
             self._remember_scene_objects(world, player.position, beat.scene_objects)
             heal = self.random.randint(2, 5)
             player.hp = min(player.max_hp, player.hp + heal)
@@ -223,6 +247,7 @@ class WorldEngine:
 
         if text == "attack":
             beat = director.respond_to_action(world, player, "attack", location, npc, memory_context)
+            self._apply_beat_context(world, beat)
             self._remember_scene_objects(world, player.position, beat.scene_objects)
             if location is None:
                 self._advance_world(world, player, director, memory, "attack")
@@ -235,7 +260,7 @@ class WorldEngine:
                 memory.remember_world_state(world, player)
                 return CommandResult(f"{location.name} is tense but quiet. Nothing attacks back.", advance_time=True)
 
-            success = self._roll_attack(player, 10 + location.danger)
+            success = self._roll_attack(world, player, 10 + location.danger)
             if success:
                 reward = self.random.randint(3, 8)
                 player.gold += reward
@@ -250,7 +275,9 @@ class WorldEngine:
                     tags=[location.name, "combat", "victory"],
                 )
                 memory.remember_location(location, world.tick)
-                message = f"{beat.narration} You drive the threat back and claim {reward} gold in salvage."
+                world.current_activity = None
+                world.movement_lock = None
+                message = f"{beat.narration}\n\n{world.last_roll} You drive the threat back and claim {reward} gold in salvage."
             else:
                 damage = self.random.randint(2, 6)
                 player.hp = max(0, player.hp - damage)
@@ -264,7 +291,9 @@ class WorldEngine:
                     tags=[location.name, "combat", "danger"],
                 )
                 memory.remember_location(location, world.tick)
-                message = f"{beat.narration} The fight turns against you. You take {damage} damage."
+                world.current_activity = "combat"
+                world.movement_lock = "you are in a fight"
+                message = f"{beat.narration}\n\n{world.last_roll} The fight turns against you. You take {damage} damage."
             self._advance_world(world, player, director, memory, "attack")
             memory.remember_world_state(world, player)
             return CommandResult(message, advance_time=True)
@@ -274,7 +303,7 @@ class WorldEngine:
             memory.remember_world_state(world, player)
             return CommandResult("You keep still long enough to notice the world changing around you.", advance_time=True)
 
-        return self._resolve_freeform_action(command.strip(), world, player, director, memory, location, npc, memory_context)
+        return self._resolve_freeform_action(raw_command, world, player, director, memory, location, npc, memory_context)
 
     def location_at(self, world: World, position: Position) -> Location | None:
         for location in world.locations:
@@ -296,8 +325,85 @@ class WorldEngine:
     def passable(self, world: World, position: Position) -> bool:
         return world.tiles[position.y][position.x] != Biome.WATER
 
-    def player_bonus(self, player: Player) -> int:
-        return {"warrior": 4, "rogue": 3, "mage": 2, "ranger": 3}.get(player.archetype, 2)
+    def player_bonus(self, player: Player, check_kind: str | None = None) -> int:
+        bonus = {"warrior": 4, "rogue": 3, "mage": 2, "ranger": 3}.get(player.archetype, 2)
+        if check_kind:
+            bonus += player.boosts.get(check_kind, 0)
+            bonus += self._skill_bonus_for_check(player, check_kind)
+        carried = {item.lower() for item in player.inventory}
+        if check_kind == "exploration_check":
+            if "torch" in carried:
+                bonus += 1
+            if player.archetype == "ranger":
+                bonus += 1
+        elif check_kind == "social_check":
+            if player.archetype == "rogue":
+                bonus += 1
+        elif check_kind == "combat_check":
+            if player.archetype == "warrior":
+                bonus += 1
+        return bonus
+
+    def _skill_bonus_for_check(self, player: Player, check_kind: str) -> int:
+        skill_groups = {
+            "exploration_check": {
+                "tracking",
+                "stealth",
+                "survival",
+                "investigation",
+                "perception",
+                "spirit_lore",
+                "ritual",
+                "medicine",
+                "sailing",
+                "endurance",
+            },
+            "social_check": {
+                "courtly_etiquette",
+                "diplomacy",
+                "deception",
+                "insight",
+                "command",
+                "intimidation",
+                "performance",
+                "trade",
+                "streetwise",
+            },
+            "combat_check": {
+                "dueling",
+                "archery",
+                "melee",
+                "tactics",
+                "endurance",
+                "command",
+                "guard",
+                "athletics",
+            },
+        }
+        matching = [player.boosts.get(skill, 0) for skill in skill_groups.get(check_kind, set())]
+        return max(matching, default=0)
+
+    def _apply_beat_context(self, world: World, beat: DirectorBeat) -> None:
+        world.current_choices = list(beat.choices[:4]) or self._default_choices(beat)
+        if beat.follow_up_hook:
+            world.active_quest = beat.follow_up_hook
+        if beat.mechanical_request == "combat_check" or "combat" in beat.tags:
+            world.current_activity = "combat"
+            world.movement_lock = "you are in a fight"
+        elif beat.mechanical_request in {"exploration_check", "social_check"}:
+            world.current_activity = beat.mechanical_request.replace("_check", "")
+            if world.movement_lock != "you are in a fight":
+                world.movement_lock = None
+
+    def _default_choices(self, beat: DirectorBeat) -> list[str]:
+        tags = set(beat.tags)
+        if beat.mechanical_request == "combat_check" or "combat" in tags:
+            return ["press the attack", "look for cover", "flee"]
+        if beat.mechanical_request == "social_check" or "social" in tags:
+            return ["press for details", "offer help", "change the subject"]
+        if beat.mechanical_request == "exploration_check" or "exploration" in tags:
+            return ["search carefully", "follow the clue", "return to the path"]
+        return ["look around", "move on", "wait"]
 
     def summary_counts(self, world: World) -> dict[str, int]:
         return {
@@ -328,6 +434,7 @@ class WorldEngine:
         if unavailable is not None:
             return CommandResult(unavailable)
         beat = director.respond_to_freeform_action(world, player, action, location, npc, memory_context)
+        self._apply_beat_context(world, beat)
         self._remember_scene_objects(world, player.position, beat.scene_objects)
         visible_items = self.scene_objects_at(world, player.position)
         added = self._apply_inventory_changes(player, world, action, beat, visible_items)
@@ -358,7 +465,13 @@ class WorldEngine:
             suffix_parts.append(f"Added to inventory: {', '.join(added)}.")
         if removed_scene_items:
             suffix_parts.append(f"Scene changed: {', '.join(removed_scene_items)}.")
-        suffix = f" {' '.join(suffix_parts)}" if suffix_parts else ""
+        if beat.mechanical_request is not None:
+            success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
+            suffix_parts.insert(0, world.last_roll or "")
+            if not success and beat.mechanical_request == "combat_check":
+                world.current_activity = "combat"
+                world.movement_lock = "you are in a fight"
+        suffix = f"\n\n{' '.join(suffix_parts)}" if suffix_parts else ""
         return CommandResult(f"{beat.narration}{suffix}", advance_time=True)
 
     def _apply_inventory_changes(
@@ -628,6 +741,14 @@ class WorldEngine:
     def _apply_world_details(self, world: World, details: dict[str, object] | None) -> None:
         if not details:
             return
+        campaign_title = details.get("campaign_title")
+        if isinstance(campaign_title, str) and campaign_title.strip():
+            world.campaign_title = campaign_title.strip()[:80]
+
+        overarching_quest = details.get("overarching_quest")
+        if isinstance(overarching_quest, str) and overarching_quest.strip():
+            world.overarching_quest = overarching_quest.strip()[:240]
+
         weather = details.get("weather")
         if isinstance(weather, str) and weather.strip():
             world.weather = weather.strip()[:80]
@@ -676,6 +797,34 @@ class WorldEngine:
         if hooks:
             world.quest_hooks = hooks[:6]
 
+        archetypes = [item.strip().lower() for item in details.get("player_archetypes", []) if isinstance(item, str) and item.strip()]
+        if archetypes:
+            world.player_archetype_options = archetypes[:6]
+
+        blurbs = details.get("player_archetype_blurbs")
+        if isinstance(blurbs, dict):
+            world.player_archetype_blurbs = {
+                key: value
+                for key, value in blurbs.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+
+        boosts = details.get("player_archetype_boosts")
+        if isinstance(boosts, dict):
+            world.player_archetype_boosts = {
+                key: {
+                    boost_key: boost_value
+                    for boost_key, boost_value in value.items()
+                    if isinstance(boost_key, str) and isinstance(boost_value, int)
+                }
+                for key, value in boosts.items()
+                if isinstance(key, str) and isinstance(value, dict)
+            }
+
+        homelands = [item.strip() for item in details.get("homelands", []) if isinstance(item, str) and item.strip()]
+        if homelands:
+            world.homeland_options = homelands[:8]
+
         opening_event = details.get("opening_event")
         if isinstance(opening_event, str) and opening_event.strip():
             self._add_event(world, "world", opening_event.strip()[:180])
@@ -684,11 +833,18 @@ class WorldEngine:
         world.recent_events.insert(0, Event(tick=world.tick, category=category, text=text, severity=severity))
         del world.recent_events[6:]
 
-    def _roll_check(self, player: Player, difficulty: int) -> bool:
-        return self.random.randint(1, 20) + self.player_bonus(player) >= difficulty
+    def _roll_check(self, world: World, player: Player, difficulty: int, check_kind: str | None = None) -> bool:
+        roll = self.random.randint(1, 20)
+        bonus = self.player_bonus(player, check_kind)
+        total = roll + bonus
+        success = total >= difficulty
+        label = (check_kind or "check").replace("_check", "").title()
+        player_context = f"d20 {roll} + bonus {bonus} = {total}"
+        world.last_roll = f"Roll: {label} vs DC {difficulty}: {player_context} -> {'success' if success else 'failure'}."
+        return success
 
-    def _roll_attack(self, player: Player, difficulty: int) -> bool:
-        return self.random.randint(1, 20) + self.player_bonus(player) >= difficulty
+    def _roll_attack(self, world: World, player: Player, difficulty: int) -> bool:
+        return self._roll_check(world, player, difficulty, "combat_check")
 
     def _generate_tiles(self, width: int, height: int) -> list[list[Biome]]:
         tiles: list[list[Biome]] = []

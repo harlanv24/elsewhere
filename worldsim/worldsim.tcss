@@ -13,34 +13,89 @@ Screen {
     height: 1fr;
 }
 
+#landing-screen,
 #setup-screen {
     width: 100%;
     align: center middle;
     height: 1fr;
 }
 
+#landing-card,
 #setup-card {
-    width: 72;
+    width: 96;
     height: auto;
     border: round #8b5cf6;
     background: #171a22;
     padding: 1 2;
 }
 
+#landing-title,
 #setup-title {
     color: #f8fafc;
     text-style: bold;
     margin-bottom: 1;
 }
 
+#save-summary,
 #setup-subtitle {
     color: #a5b4fc;
     margin-bottom: 1;
 }
 
+#landing-actions,
 #setup-actions {
     height: auto;
     margin-top: 1;
+}
+
+#setup-error {
+    color: #fca5a5;
+    margin-top: 1;
+    height: auto;
+    max-height: 5;
+    overflow: auto auto;
+}
+
+#character-select {
+    display: none;
+    height: 22;
+    margin-top: 1;
+}
+
+#selection-grid {
+    height: 100%;
+}
+
+#class-options-panel {
+    width: 28%;
+    height: 100%;
+    border: round #334155;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+#homeland-options-panel {
+    width: 28%;
+    height: 100%;
+    border: round #334155;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+#class-detail-panel {
+    width: 1fr;
+    height: 100%;
+    border: round #8b5cf6;
+    padding: 0 1;
+    overflow: auto auto;
+    color: #dbeafe;
+}
+
+#class-options-title,
+#homeland-options-title {
+    color: #f8d774;
+    text-style: bold;
+    height: 1;
 }
 
 #game-screen {

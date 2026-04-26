@@ -58,6 +58,7 @@ class Player:
     xp: int
     position: Position
     inventory: list[str] = field(default_factory=lambda: ["bedroll", "torch", "rations"])
+    boosts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -79,6 +80,7 @@ class DirectorBeat:
     scene_objects: list[str] = field(default_factory=list)
     inventory_add: list[str] = field(default_factory=list)
     inventory_remove: list[str] = field(default_factory=list)
+    choices: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -99,6 +101,18 @@ class World:
     state_facts: list[str] = field(default_factory=list)
     weather: str = "Clear"
     stability: int = 70
+    theme_prompt: str = "grounded fantasy frontier"
+    campaign_title: str = "Untitled Frontier"
+    overarching_quest: str = "Uncover the central threat shaping the frontier."
+    active_quest: str | None = None
+    current_choices: list[str] = field(default_factory=list)
+    current_activity: str | None = None
+    movement_lock: str | None = None
+    last_roll: str | None = None
+    player_archetype_options: list[str] = field(default_factory=lambda: ["warrior", "rogue", "mage", "ranger"])
+    player_archetype_blurbs: dict[str, str] = field(default_factory=dict)
+    player_archetype_boosts: dict[str, dict[str, int]] = field(default_factory=dict)
+    homeland_options: list[str] = field(default_factory=list)
 
 
 @dataclass

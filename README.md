@@ -74,7 +74,7 @@ You can also type freeform actions, such as `take journal`, `read the inscriptio
 
 `worldsim/llm_client.py`
 
-- Minimal dependency-free client for local `/v1/chat/completions` endpoints
+- Minimal dependency-free client for OpenAI-compatible `/v1/chat/completions` endpoints
 
 `worldsim/area.py`
 
@@ -123,15 +123,38 @@ The engine then decides:
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
 
-The demo now uses a locally hosted OpenAI-compatible chat server by default for testing:
+The demo uses an OpenAI-compatible chat completions endpoint. If `OPENAI_API_KEY`
+or `WORLDSIM_LLM_API_KEY` is set and `WORLDSIM_LLM_BASE_URL` is not set, it uses
+OpenAI's API by default:
 
 ```bash
-set WORLDSIM_LLM_BASE_URL=http://localhost:8080/v1
-set WORLDSIM_LLM_MODEL=Qwen2.5-7B-Coder
+export OPENAI_API_KEY=sk-...
 python main.py
 ```
 
-On macOS/Linux, use `export` instead of `set`. To force the deterministic mock instead, set `WORLDSIM_DIRECTOR=mock`. Streaming is enabled by default; set `WORLDSIM_LLM_STREAM=0` to use one blocking response.
+By default, that selects `gpt-5.2-chat-latest`, the current ChatGPT chat model
+listed in the OpenAI model docs. You can override it:
+
+```bash
+export WORLDSIM_LLM_MODEL=gpt-5.2
+python main.py
+```
+
+Your ChatGPT login or subscription does not automatically authenticate a local
+Python app. For OpenAI-hosted models, create and set an API key. API usage is
+billed separately from most ChatGPT plans.
+
+To use a locally hosted OpenAI-compatible chat server instead:
+
+```bash
+export WORLDSIM_LLM_BASE_URL=http://localhost:8080/v1
+export WORLDSIM_LLM_MODEL=Qwen2.5-7B-Coder
+python main.py
+```
+
+On Windows `cmd.exe`, use `set` instead of `export`. To force the deterministic
+mock instead, set `WORLDSIM_DIRECTOR=mock`. Streaming is enabled by default; set
+`WORLDSIM_LLM_STREAM=0` to use one blocking response.
 
 With `llama.cpp`, start `llama-server` with an OpenAI-compatible endpoint first. A typical shape is:
 

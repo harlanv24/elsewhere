@@ -87,6 +87,14 @@ class CampaignMemory:
             importance=9,
             tags=[player.name, player.archetype, "player"],
         )
+        self.remember(
+            "campaign",
+            "overarching_quest",
+            f"{world.campaign_title}: {world.overarching_quest}",
+            world.tick,
+            importance=9,
+            tags=["campaign", "quest", world.campaign_title],
+        )
 
     def relevant_context(self, world: World, player: Player, scope: str | None = None, limit: int = 5) -> list[str]:
         scored: list[tuple[int, MemoryEntry]] = []
@@ -183,6 +191,18 @@ class CampaignStore:
             "state_facts": list(world.state_facts),
             "weather": world.weather,
             "stability": world.stability,
+            "theme_prompt": world.theme_prompt,
+            "campaign_title": world.campaign_title,
+            "overarching_quest": world.overarching_quest,
+            "active_quest": world.active_quest,
+            "current_choices": list(world.current_choices),
+            "current_activity": world.current_activity,
+            "movement_lock": world.movement_lock,
+            "last_roll": world.last_roll,
+            "player_archetype_options": list(world.player_archetype_options),
+            "player_archetype_blurbs": dict(world.player_archetype_blurbs),
+            "player_archetype_boosts": dict(world.player_archetype_boosts),
+            "homeland_options": list(world.homeland_options),
         }
 
     def _deserialize_world(self, payload: dict[str, object]) -> World:
@@ -228,12 +248,36 @@ class CampaignStore:
             state_facts=list(payload.get("state_facts", [])),
             weather=payload["weather"],
             stability=payload["stability"],
+            theme_prompt=payload.get("theme_prompt", "grounded fantasy frontier"),
+            campaign_title=payload.get("campaign_title", "Untitled Frontier"),
+            overarching_quest=payload.get("overarching_quest", "Uncover the central threat shaping the frontier."),
+            active_quest=payload.get("active_quest"),
+            current_choices=list(payload.get("current_choices", [])),
+            current_activity=payload.get("current_activity"),
+            movement_lock=payload.get("movement_lock"),
+            last_roll=payload.get("last_roll"),
+            player_archetype_options=list(payload.get("player_archetype_options", ["warrior", "rogue", "mage", "ranger"])),
+            player_archetype_blurbs=dict(payload.get("player_archetype_blurbs", {})),
+            player_archetype_boosts=dict(payload.get("player_archetype_boosts", {})),
+            homeland_options=list(payload.get("homeland_options", [])),
         )
 
     def _serialize_state(self, world: World, player: Player, memory: CampaignMemory) -> dict[str, object]:
         position_key = f"{player.position.x},{player.position.y}"
         return {
             "tick": world.tick,
+            "theme_prompt": world.theme_prompt,
+            "campaign_title": world.campaign_title,
+            "overarching_quest": world.overarching_quest,
+            "active_quest": world.active_quest,
+            "current_choices": list(world.current_choices),
+            "current_activity": world.current_activity,
+            "movement_lock": world.movement_lock,
+            "last_roll": world.last_roll,
+            "player_archetype_options": list(world.player_archetype_options),
+            "player_archetype_blurbs": dict(world.player_archetype_blurbs),
+            "player_archetype_boosts": dict(world.player_archetype_boosts),
+            "homeland_options": list(world.homeland_options),
             "player": self._serialize_player(player),
             "current_position": position_key,
             "visible_scene_objects": list(world.scene_objects.get(position_key, [])),
@@ -254,6 +298,7 @@ class CampaignStore:
             "xp": player.xp,
             "position": {"x": player.position.x, "y": player.position.y},
             "inventory": list(player.inventory),
+            "boosts": dict(player.boosts),
         }
 
     def _deserialize_player(self, payload: dict[str, object]) -> Player:
@@ -267,4 +312,5 @@ class CampaignStore:
             xp=payload["xp"],
             position=Position(payload["position"]["x"], payload["position"]["y"]),
             inventory=list(payload["inventory"]),
+            boosts=dict(payload.get("boosts", {})),
         )

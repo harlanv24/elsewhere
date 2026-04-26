@@ -169,7 +169,18 @@ python -m worldsim.llm_probe
 ```
 
 The System tab shows the active director and reports the last LLM fallback error.
-During LLM commands, the Director panel streams the raw JSON response as it arrives and then replaces it with the parsed narration once the response is complete.
+During LLM commands, the console streams just the narration portion of the JSON response and then replaces it with the parsed final beat.
+
+When OpenAI streaming is active, the app requests token usage metadata and shows
+session totals plus estimated cost in the top bar and System tab. The estimate is
+based on reported prompt/completion tokens and a local pricing table. To override
+pricing for another model or changed rates, set:
+
+```bash
+export WORLDSIM_LLM_INPUT_COST_PER_1M=1.75
+export WORLDSIM_LLM_OUTPUT_COST_PER_1M=14
+export WORLDSIM_LLM_CACHED_INPUT_COST_PER_1M=0.175
+```
 
 The app sends JSON with:
 

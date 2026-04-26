@@ -21,6 +21,7 @@ from worldsim.director import director_from_env
 from worldsim.engine import WorldEngine
 from worldsim.memory import CampaignMemory, CampaignStore
 from worldsim.models import Biome, Location, Npc, Player, Position, World
+from worldsim.usage import TokenUsageTracker, format_tokens
 
 if TYPE_CHECKING:
     from textual.events import Click
@@ -876,7 +877,7 @@ class WorldSimApp(App[None]):
         self._sync_area_state(location)
 
         self.query_one("#topbar", Static).update(
-            f"{world.campaign_title}  |  Tick {world.tick:,}  |  Stability {world.stability}%"
+            self._topbar_text(world)
         )
         map_panel = self.query_one("#map-panel", Static)
         map_panel.border_subtitle = self._map_status(world)
@@ -1319,6 +1320,7 @@ class WorldSimApp(App[None]):
         state_target = Path(self.store.state_path).resolve()
         director_status = getattr(self.director, "status_line", f"Director: {type(self.director).__name__}")
         debug_path = str(self.debug_logger.path.resolve()) if self.debug_logger is not None else "disabled"
+        usage_lines = self._usage_text()
         return "\n".join(
             [
                 "Canonical engine state is stored locally.",
@@ -1327,6 +1329,9 @@ class WorldSimApp(App[None]):
                 f"Debug log: {debug_path}",
                 f"Tracked memory entries: {len(memory.entries)}",
                 director_status,
+                "",
+                "API usage:",
+                *usage_lines,
                 "",
                 "LLM boundary:",
                 "- engine owns rolls, HP, movement, state mutation",
@@ -1347,6 +1352,41 @@ class WorldSimApp(App[None]):
                 "- / focuses the command line",
             ]
         )
+
+    def _topbar_text(self, world: World) -> str:
+        usage = self._usage_tracker()
+        if usage is None or usage.request_count == 0:
+            usage_text = "LLM usage pending"
+        else:
+            cost_text = f"${usage.estimated_cost:.4f}" if usage.estimated_cost else "cost unknown"
+            usage_text = f"{format_tokens(usage.total_tokens)} tokens  |  est. {cost_text}"
+        return (
+            f"{world.campaign_title}  |  Tick {world.tick:,}  |  Stability {world.stability}%\n"
+            f"{usage_text}"
+        )
+
+    def _usage_text(self) -> list[str]:
+        usage = self._usage_tracker()
+        if usage is None:
+            return ["No LLM usage tracker is attached to the active director."]
+        lines = [usage.summary_line()]
+        last = usage.last_record
+        if last is not None:
+            last_cost = f"${last.estimated_cost:.5f}" if last.estimated_cost is not None else "unknown"
+            lines.append(
+                f"Last request: {format_tokens(last.total_tokens)} tokens "
+                f"({format_tokens(last.prompt_tokens)} in / {format_tokens(last.completion_tokens)} out), "
+                f"est. {last_cost}"
+            )
+            if last.cached_prompt_tokens:
+                lines.append(f"Cached input tokens last request: {format_tokens(last.cached_prompt_tokens)}")
+        lines.append("Cost is estimated from reported tokens and the local pricing table/env overrides.")
+        return lines
+
+    def _usage_tracker(self) -> TokenUsageTracker | None:
+        client = getattr(self.director, "client", None)
+        tracker = getattr(client, "usage_tracker", None)
+        return tracker if isinstance(tracker, TokenUsageTracker) else None
 
     def _player_level(self, player: Player) -> int:
         thresholds = [0, 5, 15, 30, 50, 75, 105]

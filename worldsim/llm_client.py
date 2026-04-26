@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from worldsim.debug import DebugLogger
+from worldsim.usage import TokenUsageTracker
 
 
 class LLMClientError(RuntimeError):
@@ -66,6 +67,7 @@ class LLMClient:
     def __init__(self, config: LLMClientConfig, debug_logger: DebugLogger | None = None) -> None:
         self.config = config
         self.debug_logger = debug_logger
+        self.usage_tracker = TokenUsageTracker()
 
     @classmethod
     def from_env(cls, debug_logger: DebugLogger | None = None) -> LLMClient:
@@ -86,6 +88,8 @@ class LLMClient:
     ) -> str:
         payload = self._request_payload(system, user, json_mode=self.config.json_mode, response_schema=response_schema)
         payload["stream"] = True
+        if self._uses_openai_api():
+            payload["stream_options"] = {"include_usage": True}
         return self._post_streaming_chat_completion(payload, on_delta)
 
     def _request_payload(
@@ -146,6 +150,7 @@ class LLMClient:
                 raise LLMClientError(
                     "LLM response was truncated before it finished. Increase WORLDSIM_LLM_MAX_TOKENS."
                 )
+            self._record_usage(result.get("usage"))
             return str(choice["message"]["content"])
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             raise LLMClientError("LLM response did not match OpenAI chat completions format.") from exc
@@ -183,6 +188,7 @@ class LLMClient:
         chunks: list[str] = []
         raw_events: list[str] = []
         finish_reason: str | None = None
+        usage: dict[str, Any] | None = None
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line.startswith("data:"):
@@ -193,7 +199,13 @@ class LLMClient:
             raw_events.append(data)
             try:
                 event = json.loads(data)
-                choice = event["choices"][0]
+                event_usage = event.get("usage")
+                if isinstance(event_usage, dict):
+                    usage = event_usage
+                choices = event.get("choices", [])
+                if not choices:
+                    continue
+                choice = choices[0]
                 finish_reason = choice.get("finish_reason") or finish_reason
                 delta = choice.get("delta", {})
                 content = delta.get("content")
@@ -213,11 +225,13 @@ class LLMClient:
                 finish_reason=finish_reason,
                 raw_event_count=len(raw_events),
                 raw_events=raw_events,
+                usage=usage,
             )
         if finish_reason == "length":
             raise LLMClientError(
                 "LLM streaming response was truncated before it finished. Increase WORLDSIM_LLM_MAX_TOKENS."
             )
+        self._record_usage(usage)
         return text
 
     def _log_request(self, payload: dict[str, object]) -> None:
@@ -241,6 +255,24 @@ class LLMClient:
 
     def _uses_openai_api(self) -> bool:
         return self.config.base_url.startswith("https://api.openai.com/")
+
+    def _record_usage(self, usage: object) -> None:
+        if not isinstance(usage, dict):
+            return
+        record = self.usage_tracker.record(self.config.model, usage)
+        if self.debug_logger is None or record is None:
+            return
+        self.debug_logger.log(
+            "llm_usage",
+            model=record.model,
+            prompt_tokens=record.prompt_tokens,
+            completion_tokens=record.completion_tokens,
+            total_tokens=record.total_tokens,
+            cached_prompt_tokens=record.cached_prompt_tokens,
+            estimated_cost=record.estimated_cost,
+            session_request_count=self.usage_tracker.request_count,
+            session_estimated_cost=self.usage_tracker.estimated_cost,
+        )
 
     def _response_format(self, response_schema: dict[str, object] | None) -> dict[str, object]:
         if self._uses_openai_api() and response_schema is not None:

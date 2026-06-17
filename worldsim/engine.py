@@ -134,6 +134,8 @@ class WorldEngine:
             self._remember_scene_objects(world, player.position, beat.scene_objects)
             success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
             place = location.name if location else "the wilds"
+            follow_up = self._roll_follow_up("explore", success, beat, location, npc)
+            world.current_choices = self._merge_choices(follow_up["choices"], beat.choices)
             if success:
                 gain = self.random.randint(2, 6)
                 player.gold += gain
@@ -152,7 +154,7 @@ class WorldEngine:
                     importance=7,
                     tags=[place, "discovery"],
                 )
-                message = f"{beat.narration}\n\n{world.last_roll} You recover {gain} gold and useful leverage."
+                message = f"{beat.narration}\n\n{world.last_roll} You recover {gain} gold and useful leverage.\n{follow_up['prompt']}"
             else:
                 damage = self.random.randint(1, 4)
                 player.hp = max(0, player.hp - damage)
@@ -167,7 +169,7 @@ class WorldEngine:
                     importance=8,
                     tags=[place, "danger"],
                 )
-                message = f"{beat.narration}\n\n{world.last_roll} The search goes badly and you take {damage} damage."
+                message = f"{beat.narration}\n\n{world.last_roll} The search goes badly and you take {damage} damage.\n{follow_up['prompt']}"
             self._apply_progression(world, player, beat, memory, location, success)
             self._advance_world(world, player, director, memory, "explore")
             memory.remember_world_state(world, player)
@@ -269,6 +271,8 @@ class WorldEngine:
                 return CommandResult(f"{location.name} is tense but quiet. Nothing attacks back.", advance_time=True)
 
             success = self._roll_attack(world, player, 10 + location.danger)
+            follow_up = self._roll_follow_up("attack", success, beat, location, npc)
+            world.current_choices = self._merge_choices(follow_up["choices"], beat.choices)
             if success:
                 reward = self.random.randint(3, 8)
                 player.gold += reward
@@ -285,7 +289,7 @@ class WorldEngine:
                 memory.remember_location(location, world.tick)
                 world.current_activity = None
                 world.movement_lock = None
-                message = f"{beat.narration}\n\n{world.last_roll} You drive the threat back and claim {reward} gold in salvage."
+                message = f"{beat.narration}\n\n{world.last_roll} You drive the threat back and claim {reward} gold in salvage.\n{follow_up['prompt']}"
             else:
                 damage = self.random.randint(2, 6)
                 player.hp = max(0, player.hp - damage)
@@ -301,7 +305,7 @@ class WorldEngine:
                 memory.remember_location(location, world.tick)
                 world.current_activity = "combat"
                 world.movement_lock = "you are in a fight"
-                message = f"{beat.narration}\n\n{world.last_roll} The fight turns against you. You take {damage} damage."
+                message = f"{beat.narration}\n\n{world.last_roll} The fight turns against you. You take {damage} damage.\n{follow_up['prompt']}"
             self._apply_progression(world, player, beat, memory, location, success)
             self._advance_world(world, player, director, memory, "attack")
             memory.remember_world_state(world, player)
@@ -411,6 +415,73 @@ class WorldEngine:
         if beat.mechanical_request == "exploration_check" or "exploration" in tags:
             return ["search carefully", "follow the clue", "return to the path"]
         return ["look around", "move on", "wait"]
+
+    def _merge_choices(self, primary: list[str], secondary: list[str], limit: int = 4) -> list[str]:
+        merged: list[str] = []
+        for choice in primary + secondary:
+            cleaned = " ".join(choice.split())
+            if not cleaned:
+                continue
+            if cleaned in merged:
+                continue
+            merged.append(cleaned)
+            if len(merged) >= limit:
+                break
+        return merged
+
+    def _roll_follow_up(
+        self,
+        action: str,
+        success: bool,
+        beat: DirectorBeat,
+        location: Location | None,
+        npc: Npc | None,
+    ) -> dict[str, list[str] | str]:
+        place = location.name if location is not None else "here"
+        if action == "explore":
+            if success:
+                return {
+                    "prompt": f"Next: follow the lead, search {place} again, or return to the road.",
+                    "choices": ["follow the lead", "search again", "return to the road"],
+                }
+            return {
+                "prompt": f"Next: regroup, try a different angle, or retreat from {place}.",
+                "choices": ["regroup", "try a different angle", "retreat"],
+            }
+        if action == "attack":
+            if success:
+                return {
+                    "prompt": "Next: press the advantage, search the fallen threat, or stand down.",
+                    "choices": ["press the advantage", "search the fallen threat", "stand down"],
+                }
+            return {
+                "prompt": "Next: hold your ground, retreat, or brace for another strike.",
+                "choices": ["hold your ground", "retreat", "brace for another strike"],
+            }
+        if beat.mechanical_request == "social_check" or "social" in beat.tags:
+            if success:
+                return {
+                    "prompt": "Next: press for details, offer help, or ask about the next lead.",
+                    "choices": ["press for details", "offer help", "ask for the next lead"],
+                }
+            return {
+                "prompt": "Next: change the subject, back off, or try a gentler approach.",
+                "choices": ["change the subject", "back off", "try a gentler approach"],
+            }
+        if beat.mechanical_request == "exploration_check" or "exploration" in beat.tags:
+            if success:
+                return {
+                    "prompt": f"Next: inspect the find, follow it deeper, or leave {place} for now.",
+                    "choices": ["inspect the find", "follow it deeper", "leave for now"],
+                }
+            return {
+                "prompt": "Next: look again, change tactics, or fall back and recover.",
+                "choices": ["look again", "change tactics", "fall back"],
+            }
+        return {
+            "prompt": "Next: look around, move on, or wait and see what changes.",
+            "choices": ["look around", "move on", "wait"],
+        }
 
     def _ensure_progression(self, world: World) -> None:
         if not world.quests:
@@ -620,6 +691,9 @@ class WorldEngine:
         if beat.mechanical_request is not None:
             success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
             suffix_parts.insert(0, world.last_roll or "")
+            follow_up = self._roll_follow_up(action, success, beat, location, npc)
+            world.current_choices = self._merge_choices(follow_up["choices"], beat.choices)
+            suffix_parts.append(follow_up["prompt"])
             if not success and beat.mechanical_request == "combat_check":
                 world.current_activity = "combat"
                 world.movement_lock = "you are in a fight"
@@ -1022,8 +1096,11 @@ class WorldEngine:
         total = roll + bonus
         success = total >= difficulty
         label = (check_kind or "check").replace("_check", "").title()
-        player_context = f"d20 {roll} + bonus {bonus} = {total}"
-        world.last_roll = f"Roll: {label} vs DC {difficulty}: {player_context} -> {'success' if success else 'failure'}."
+        bonus_text = f"+ {bonus}" if bonus >= 0 else f"- {abs(bonus)}"
+        world.last_roll = (
+            f"Roll: {label} vs DC {difficulty}: raw d20 {roll}, bonus {bonus_text}, total {total} "
+            f"-> {'success' if success else 'failure'}."
+        )
         return success
 
     def _roll_attack(self, world: World, player: Player, difficulty: int) -> bool:

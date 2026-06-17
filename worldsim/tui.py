@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -210,7 +211,8 @@ class WorldSimApp(App[None]):
     CSS_PATH = "worldsim.tcss"
     BINDINGS = [
         Binding("ctrl+n", "show_setup", "New Campaign", show=False),
-        Binding("m", "focus_map", "Map Focus", show=False),
+        Binding("m", "show_map_tab", "Map", show=False, priority=True),
+        Binding("w", "show_world_tab", "World", show=False, priority=True),
         Binding("escape", "focus_map", "Map Focus", show=False, priority=True),
         Binding("slash", "focus_command", "Command", show=False, priority=True),
     ]
@@ -314,27 +316,27 @@ class WorldSimApp(App[None]):
                         yield MapPanel(id="map-panel", classes="panel")
                         with Vertical(classes="stack play-sidebar"):
                             yield Static(id="local-panel", classes="panel")
-                            yield Static(id="director-panel", classes="panel")
-                            with Horizontal(id="adventure-command-bar", classes="panel"):
-                                yield Static(">", id="adventure-prompt")
-                                yield Input(placeholder="Type an action, dialogue, or command", id="adventure-command-input")
-                                yield Button("Send", id="adventure-send-button", compact=True)
+                            with Vertical(id="director-panel", classes="panel"):
+                                yield Static(id="director-text")
+                                with Horizontal(id="adventure-command-bar"):
+                                    yield Static(">", id="adventure-prompt")
+                                    yield Input(placeholder="Type an action, dialogue, or command", id="adventure-command-input")
+                                    yield Button("Send", id="adventure-send-button", compact=True)
+                                    yield Button("Quit", id="game-quit-button", compact=True)
                         with Vertical(classes="stack"):
                             with Vertical(id="actions-panel", classes="panel"):
-                                yield Button("Look", id="action-look", compact=True)
-                                yield Button("Explore", id="action-explore", compact=True)
-                                yield Button("Talk", id="action-talk", compact=True)
-                                yield Button("Attack", id="action-attack", compact=True)
-                                yield Button("Rest", id="action-rest", compact=True)
-                                yield Button("Wait", id="action-wait", compact=True)
                                 yield Static("Choices", id="choice-title")
                                 for index in range(4):
-                                    yield Button("Choice", id=f"choice-btn-{index}", compact=True)
+                                    yield Button("Choice", id=f"choice-btn-{index}")
                         with Vertical(classes="stack world-sidebar"):
                             yield Static(id="region-panel", classes="panel")
                             yield Static(id="events-panel", classes="panel")
                             yield Static(id="alerts-panel", classes="panel")
                             yield Static(id="summary-panel", classes="panel")
+                with TabPane("MAP", id="tab-map"):
+                    with Vertical(classes="stack map-tab"):
+                        yield MapPanel(id="overview-map-panel", classes="panel")
+                        yield Static("Press `m` to return to the world view.", id="map-tab-note")
                 with TabPane("CHARACTER", id="tab-character"):
                     with Horizontal(classes="row"):
                         with Vertical(classes="stack"):
@@ -357,10 +359,6 @@ class WorldSimApp(App[None]):
                 with TabPane("SYSTEM", id="tab-system"):
                     yield Static(id="system-panel", classes="panel")
             yield RichLog(id="console-panel", classes="panel", auto_scroll=True, highlight=False, wrap=True, min_width=20)
-            with Horizontal(id="command-bar"):
-                yield Static("worldsim >", id="prompt")
-                yield Input(placeholder="Enter a command or dialogue", id="command-input")
-                yield Button("Quit", id="game-quit-button", compact=True)
             yield Static(self._footer_text(), id="footer-note")
 
     def _set_panel_titles(self) -> None:
@@ -385,6 +383,7 @@ class WorldSimApp(App[None]):
             "#milestones-panel": "NEXT MILESTONES",
             "#system-panel": "SYSTEM NOTES",
             "#console-panel": "CONSOLE",
+            "#overview-map-panel": "FULL MAP",
         }
         for selector, title in titles.items():
             widget = self.query_one(selector)
@@ -455,7 +454,7 @@ class WorldSimApp(App[None]):
                 self._handle_command(command)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id in {"command-input", "adventure-command-input"}:
+        if event.input.id == "adventure-command-input":
             self._submit_command_input(f"#{event.input.id}")
 
     def _submit_command_input(self, selector: str) -> None:
@@ -469,7 +468,7 @@ class WorldSimApp(App[None]):
 
     def action_focus_command(self) -> None:
         if self.session is not None:
-            command_input = self.query_one("#command-input", Input)
+            command_input = self.query_one("#adventure-command-input", Input)
             if not command_input.value:
                 command_input.value = "/"
                 command_input.cursor_position = 1
@@ -502,6 +501,20 @@ class WorldSimApp(App[None]):
     def action_focus_map(self) -> None:
         if self.session is not None:
             self.query_one("#map-panel", MapPanel).focus()
+
+    def action_show_map_tab(self) -> None:
+        if self.session is None:
+            return
+        self.query_one(TabbedContent).active = "tab-map"
+        self.query_one("#overview-map-panel", MapPanel).focus()
+        self.call_after_refresh(self._sync_camera_after_layout)
+
+    def action_show_world_tab(self) -> None:
+        if self.session is None:
+            return
+        self.query_one(TabbedContent).active = "tab-world"
+        self.query_one("#map-panel", MapPanel).focus()
+        self.call_after_refresh(self._sync_camera_after_layout)
 
     def action_move_north(self) -> None:
         self._handle_command("north")
@@ -781,6 +794,16 @@ class WorldSimApp(App[None]):
             return normalized
         return normalized[: max(1, limit - 1)].rstrip() + "..."
 
+    def _wrap_paragraphs(self, text: str, width: int) -> str:
+        paragraphs = text.split("\n")
+        wrapped: list[str] = []
+        for paragraph in paragraphs:
+            if not paragraph.strip():
+                wrapped.append("")
+                continue
+            wrapped.append(textwrap.fill(paragraph, width=width, break_long_words=False, break_on_hyphens=False))
+        return "\n".join(wrapped)
+
     def _generation_status_text(self, world: World) -> str:
         if not getattr(self.director, "last_used_fallback", False):
             return "LLM world generation succeeded."
@@ -824,7 +847,7 @@ class WorldSimApp(App[None]):
             return
         world = self.session.world
         self.query_one("#topbar", Static).update(self._topbar_text(world))
-        self.query_one("#director-panel", Static).update(self._thinking_text(include_context=True))
+        self.query_one("#director-text", Static).update(self._thinking_text(include_context=True))
         self.query_one("#footer-note", Static).update(self._thinking_text())
 
     def _loading_text(self) -> Text:
@@ -919,7 +942,7 @@ class WorldSimApp(App[None]):
             live.append("\n")
             live.append(label, style="dim #9ca3af")
             self._refresh_console_panel(live)
-            self.query_one("#director-panel", Static).update(self._thinking_text(include_context=True))
+            self.query_one("#director-text", Static).update(self._thinking_text(include_context=True))
 
     def _append_stream_delta(self, delta: str) -> None:
         self.stream_buffer += delta
@@ -944,7 +967,7 @@ class WorldSimApp(App[None]):
         self._refresh_ui()
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        if self.session is None or event.pane.id != "tab-world":
+        if self.session is None or event.pane.id not in {"tab-world", "tab-map"}:
             return
         self.call_after_refresh(self._sync_camera_after_layout)
 
@@ -969,9 +992,7 @@ class WorldSimApp(App[None]):
         self.query_one("#topbar", Static).update(
             self._topbar_text(world)
         )
-        map_panel = self.query_one("#map-panel", Static)
-        map_panel.border_subtitle = self._map_status(world)
-        map_panel.update(self._build_map_renderable())
+        self._refresh_map_panels(world)
         self.query_one("#region-panel", Static).update(self._region_text(location))
         self.query_one("#events-panel", Static).update(self._events_text(world))
         self.query_one("#alerts-panel", Static).update(self._alerts_text(world))
@@ -980,7 +1001,7 @@ class WorldSimApp(App[None]):
         self.query_one("#hooks-panel", Static).update(self._hooks_text(world))
         self._refresh_choice_buttons()
         self.query_one("#local-panel", Static).update(self._local_text(location, npc, memory))
-        self.query_one("#director-panel", Static).update(self.session.last_message)
+        self.query_one("#director-text", Static).update(self.session.last_message)
         self._refresh_inventory_buttons(player)
         self.query_one("#resources-panel", Static).update(self._resources_text(player, world))
         self.query_one("#loadout-panel", Static).update(self._inventory_detail_text(player))
@@ -1082,10 +1103,10 @@ class WorldSimApp(App[None]):
                     location.summary,
                 ]
             )
-        return "\n".join(lines)
+        return self._wrap_paragraphs("\n".join(lines), 34)
 
     def _events_text(self, world: World) -> str:
-        return "\n\n".join(f"[{event.tick}] {event.text}" for event in world.recent_events) or "No events recorded."
+        return self._wrap_paragraphs("\n\n".join(f"[{event.tick}] {event.text}" for event in world.recent_events) or "No events recorded.", 34)
 
     def _alerts_text(self, world: World) -> str:
         alerts = list(world.alerts)
@@ -1095,12 +1116,13 @@ class WorldSimApp(App[None]):
             alerts.insert(0, f"Movement locked: {world.movement_lock}")
         if world.last_roll:
             alerts.append(world.last_roll)
-        return "\n".join(f"- {alert}" for alert in alerts) or "No immediate alerts."
+        return self._wrap_paragraphs("\n".join(f"- {alert}" for alert in alerts) or "No immediate alerts.", 34)
 
     def _summary_text(self, world: World) -> str:
         counts = self.engine.summary_counts(world)
-        return "\n".join(
-            [
+        return self._wrap_paragraphs(
+            "\n".join(
+                [
                 f"Campaign: {world.campaign_title}",
                 f"World Age: {world.tick} turns",
                 f"Map Size: {world.width} x {world.height}",
@@ -1111,15 +1133,18 @@ class WorldSimApp(App[None]):
                 f"Stability: {world.stability}%",
                 f"Camera: {'FOLLOW' if self.follow_player else 'FREE'}",
                 f"Activity: {world.current_activity or 'open travel'}",
-            ]
+                ]
+            ),
+            34,
         )
 
     def _player_text(self, player: Player) -> str:
         homeland_description = ""
         if self.session is not None:
             homeland_description = self.session.world.homeland_descriptions.get(player.homeland, "")
-        return "\n".join(
-            [line for line in [
+        return self._wrap_paragraphs(
+            "\n".join(
+                [line for line in [
                 f"Name: {player.name}",
                 f"Class: {player.archetype.title()}",
                 f"Homeland: {player.homeland}",
@@ -1129,7 +1154,9 @@ class WorldSimApp(App[None]):
                 f"XP: {player.xp}",
                 "Inventory:",
                 ", ".join(player.inventory),
-            ] if line]
+                ] if line]
+            ),
+            34,
         )
 
     def _refresh_inventory_buttons(self, player: Player) -> None:
@@ -1151,24 +1178,36 @@ class WorldSimApp(App[None]):
         self.selected_inventory_index = index
         self._refresh_ui()
 
+    def _refresh_map_panels(self, world: World) -> None:
+        for selector in ("#map-panel", "#overview-map-panel"):
+            try:
+                map_panel = self.query_one(selector, Static)
+            except Exception:
+                continue
+            map_panel.border_subtitle = self._map_status(world)
+            map_panel.update(self._build_map_renderable())
+
     def _inventory_detail_text(self, player: Player) -> str:
         if not player.inventory:
             return "No item selected."
         item = player.inventory[self.selected_inventory_index]
         descriptions = self.session.world.inventory_descriptions if self.session is not None else {}
         lines = [item.title(), "", descriptions.get(item, "A carried item with no special notes yet.")]
-        return "\n".join(lines)
+        return self._wrap_paragraphs("\n".join(lines), 34)
 
     def _resources_text(self, player: Player, world: World) -> str:
-        return "\n".join(
-            [
+        return self._wrap_paragraphs(
+            "\n".join(
+                [
                 f"Gold: {player.gold}",
                 f"HP: {player.hp}/{player.max_hp}",
                 f"XP: {player.xp}",
                 f"World Tick: {world.tick}",
                 f"Weather: {world.weather}",
                 f"Stability: {world.stability}%",
-            ]
+                ]
+            ),
+            34,
         )
 
     def _loadout_text(self, player: Player) -> str:
@@ -1179,7 +1218,7 @@ class WorldSimApp(App[None]):
             "ranger": ["Primary: Longbow", "Sidearm: Hatchet", "Armor: Field coat"],
         }
         lines = defaults.get(player.archetype, ["Primary: Improvised kit"])
-        return "\n".join(lines + ["", "Ready Items:", ", ".join(player.inventory[:3]) or "None"])
+        return self._wrap_paragraphs("\n".join(lines + ["", "Ready Items:", ", ".join(player.inventory[:3]) or "None"]), 34)
 
     def _packs_text(self, player: Player) -> str:
         tags = {
@@ -1197,7 +1236,7 @@ class WorldSimApp(App[None]):
                 lines.append(f"{label.title()}:")
                 lines.extend(entries)
                 lines.append("")
-        return "\n".join(lines).strip() or "No pack categories available."
+        return self._wrap_paragraphs("\n".join(lines).strip() or "No pack categories available.", 34)
 
     def _refresh_skill_buttons(self, player: Player) -> None:
         skills = self._skill_entries(player)
@@ -1225,13 +1264,16 @@ class WorldSimApp(App[None]):
         if not skills:
             return self._traits_text(player)
         name, value = skills[self.selected_skill_index]
-        return "\n".join(
-            [
+        return self._wrap_paragraphs(
+            "\n".join(
+                [
                 self._skill_label(name),
                 f"Bonus: {self._format_bonus(value)}",
                 "",
                 self._skill_description(name),
-            ]
+                ]
+            ),
+            34,
         )
 
     def _skill_entries(self, player: Player) -> list[tuple[str, int]]:
@@ -1262,8 +1304,9 @@ class WorldSimApp(App[None]):
         current_floor = self._level_xp_floor(level)
         next_floor = self._level_xp_floor(level + 1)
         remaining = max(0, next_floor - player.xp)
-        return "\n".join(
-            [
+        return self._wrap_paragraphs(
+            "\n".join(
+                [
                 f"Current Level: {level}",
                 f"XP Total: {player.xp}",
                 f"XP Into Level: {player.xp - current_floor}",
@@ -1271,7 +1314,9 @@ class WorldSimApp(App[None]):
                 f"XP Remaining: {remaining}",
                 "",
                 "Power growth is tied to XP, inventory, skill bonuses, and archetype milestones.",
-            ]
+                ]
+            ),
+            34,
         )
 
     def _traits_text(self, player: Player) -> str:
@@ -1297,7 +1342,7 @@ class WorldSimApp(App[None]):
                 "Hunter's calm: steady performance under pressure",
             ],
         }
-        return "\n\n".join(traits.get(player.archetype, ["No archetype traits defined yet."]))
+        return self._wrap_paragraphs("\n\n".join(traits.get(player.archetype, ["No archetype traits defined yet."])), 34)
 
     def _milestones_text(self, player: Player) -> str:
         level = self._player_level(player)
@@ -1311,7 +1356,7 @@ class WorldSimApp(App[None]):
             lines.append(f"{node['text']}")
             lines.append(f"Needs {needed} more XP")
             lines.append("")
-        return "\n".join(lines).strip()
+        return self._wrap_paragraphs("\n".join(lines).strip(), 34)
 
     def _hooks_text(self, world: World) -> str:
         active = next((quest for quest in world.quests if quest.id == world.active_quest_id), None)
@@ -1344,7 +1389,7 @@ class WorldSimApp(App[None]):
             lines.append("")
         lines.append("Loose Threads:")
         lines.extend(world.quest_hooks[:5])
-        return "\n\n".join(line for line in lines if line) or "No active hooks."
+        return self._wrap_paragraphs("\n\n".join(line for line in lines if line) or "No active hooks.", 34)
 
     def _areas_text(self, location: Location | None) -> str:
         assert self.session is not None
@@ -1361,7 +1406,7 @@ class WorldSimApp(App[None]):
         lines.append(f"Entered Area: {self._display_area(self.session.entered_area)}")
         lines.append("")
         lines.append("Selecting or entering an area does not advance time.")
-        return "\n".join(lines)
+        return self._wrap_paragraphs("\n".join(lines), 34)
 
     def _local_text(self, location: Location | None, npc: Npc | None, memory: CampaignMemory) -> str:
         assert self.session is not None
@@ -1407,7 +1452,7 @@ class WorldSimApp(App[None]):
             lines.append("")
         lines.append("Relevant memory:")
         lines.extend(memory_lines or ["No strong local memories yet."])
-        return "\n".join(lines)
+        return self._wrap_paragraphs("\n".join(lines), 34)
 
     def _chronicle_text(self, world: World) -> str:
         lines = []
@@ -1415,7 +1460,7 @@ class WorldSimApp(App[None]):
             lines.append(f"[tick {event.tick}] {event.category.upper()}")
             lines.append(event.text)
             lines.append("")
-        return "\n".join(lines).strip() or "The chronicle is empty."
+        return self._wrap_paragraphs("\n".join(lines).strip() or "The chronicle is empty.", 34)
 
     def _memory_text(self, memory: CampaignMemory, world: World, player: Player) -> str:
         relevant = memory.relevant_context(world, player, limit=6)

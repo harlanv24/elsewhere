@@ -89,7 +89,7 @@ class WorldEngine:
 
         if text == "help":
             return CommandResult(
-                "Commands: north south east west, look, explore, talk, say <message>, attack, rest, wait, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare text is dialogue and slash-prefixed text is a command, like /look."
+                "Commands: north south east west, look, explore, talk, say <message>, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare text is dialogue and slash-prefixed text is a command, like /look."
             )
 
         if text in {"north", "south", "east", "west", "n", "s", "e", "w"} or text.startswith("move "):
@@ -124,6 +124,29 @@ class WorldEngine:
         location = self.location_at(world, player.position)
         npc = self.npc_at(location, world)
         memory_context = memory.relevant_context(world, player, location.name if location else None)
+
+        if text in {"inventory", "inv", "items"}:
+            return CommandResult(self._inventory_summary(player, world, location))
+
+        if text.startswith("inspect "):
+            target = raw_command.split(maxsplit=1)[1].strip()
+            return CommandResult(self._inspect_target(target, world, player, location))
+
+        if text.startswith("use "):
+            target = raw_command.split(maxsplit=1)[1].strip()
+            result = self._use_inventory_item(target, world, player, location, director, memory, memory_context)
+            if result.advance_time:
+                self._advance_world(world, player, director, memory, "freeform")
+                memory.remember_world_state(world, player)
+            return result
+
+        if text.startswith("drop "):
+            target = raw_command.split(maxsplit=1)[1].strip()
+            result = self._drop_inventory_item(target, world, player, location, director, memory)
+            if result.advance_time:
+                self._advance_world(world, player, director, memory, "freeform")
+                memory.remember_world_state(world, player)
+            return result
 
         if text == "look":
             return CommandResult(director.describe_location(world, player, location, npc, memory_context))
@@ -409,12 +432,16 @@ class WorldEngine:
     def _default_choices(self, beat: DirectorBeat) -> list[str]:
         tags = set(beat.tags)
         if beat.mechanical_request == "combat_check" or "combat" in tags:
-            return ["press the attack", "look for cover", "flee"]
+            return ["press the attack", "look for cover", "call for help"]
         if beat.mechanical_request == "social_check" or "social" in tags:
             return ["press for details", "offer help", "change the subject"]
         if beat.mechanical_request == "exploration_check" or "exploration" in tags:
-            return ["search carefully", "follow the clue", "return to the path"]
-        return ["look around", "move on", "wait"]
+            return ["search carefully", "follow the clue", "inspect the find"]
+        if "dialogue" in tags or "rumor" in tags:
+            return ["press for details", "ask who else knows", "change the subject"]
+        if "rest" in tags:
+            return ["keep watch", "pack up", "push onward"]
+        return ["inspect the scene", "press deeper", "change approach"]
 
     def _merge_choices(self, primary: list[str], secondary: list[str], limit: int = 4) -> list[str]:
         merged: list[str] = []
@@ -478,9 +505,19 @@ class WorldEngine:
                 "prompt": "Next: look again, change tactics, or fall back and recover.",
                 "choices": ["look again", "change tactics", "fall back"],
             }
+        if location is not None:
+            if success:
+                return {
+                    "prompt": f"Next: leave {place}, press deeper, or inspect the scene.",
+                    "choices": ["leave area", "press deeper", "inspect the scene"],
+                }
+            return {
+                "prompt": f"Next: force a way out, hold position, or study {place} for another opening.",
+                "choices": ["force the exit", "hold position", "study the scene"],
+            }
         return {
-            "prompt": "Next: look around, move on, or wait and see what changes.",
-            "choices": ["look around", "move on", "wait"],
+            "prompt": "Next: inspect the scene, change approach, or push onward.",
+            "choices": ["inspect the scene", "change approach", "push onward"],
         }
 
     def _ensure_progression(self, world: World) -> None:
@@ -790,6 +827,13 @@ class WorldEngine:
         verb, item = target
         if not item:
             return None
+        known_object = (
+            self._matches_known_object(item, visible_items)
+            or self._matches_known_object(item, inventory)
+            or self._object_state_for_target(world, position, item) is not None
+        )
+        if not known_object:
+            return None
         if verb in {"take", "get", "grab"} and self._matches_known_object(item, inventory):
             return f"You already have {item}."
         state = self._object_state_for_target(world, position, item)
@@ -798,8 +842,6 @@ class WorldEngine:
             if status == "in_inventory":
                 return f"You already have {item}."
             return f"The {item} is already {status}."
-        if self._matches_known_object(item, visible_items) or self._matches_known_object(item, inventory):
-            return None
         return f"There is no {item} here to {verb}."
 
     def _object_state_for_target(self, world: World, position: Position, item: str) -> dict[str, object] | None:
@@ -906,6 +948,128 @@ class WorldEngine:
         history = world.conversations.setdefault(npc.name, [])
         history.append(line)
         del history[:-limit]
+
+    def _inventory_summary(self, player: Player, world: World, location: Location | None) -> str:
+        if not player.inventory:
+            return "Inventory: empty."
+        lines = ["Inventory:"]
+        for item in player.inventory:
+            description = world.inventory_descriptions.get(item, "No special notes yet.")
+            lines.append(f"- {item.title()}: {description}")
+        if location is not None:
+            visible = self.scene_objects_at(world, player.position)
+            if visible:
+                lines.append("")
+                lines.append("Visible scene objects:")
+                lines.extend(f"- {item.title()}" for item in visible)
+        return "\n".join(lines)
+
+    def _inspect_target(self, target: str, world: World, player: Player, location: Location | None) -> str:
+        cleaned = self._clean_item_name(target)
+        if not cleaned:
+            return "Inspect what?"
+        if self._matches_known_object(cleaned, player.inventory):
+            description = world.inventory_descriptions.get(cleaned, "No special notes yet.")
+            return f"{cleaned.title()}: {description}"
+        if location is not None:
+            visible = self.scene_objects_at(world, player.position)
+            if self._matches_known_object(cleaned, visible):
+                state = self._object_state_for_target(world, player.position, cleaned)
+                if state is not None:
+                    status = state.get("status", "present")
+                    owner = state.get("owner")
+                    owner_text = f" Owner: {owner}." if isinstance(owner, str) and owner else ""
+                    return f"{cleaned.title()} is here. Status: {status}.{owner_text}"
+                return f"{cleaned.title()} is here, waiting to be taken or used."
+        state = self._object_state_for_target(world, player.position, cleaned)
+        if state is not None:
+            status = state.get("status", "unknown")
+            return f"{cleaned.title()} is recorded here with status {status}."
+        return f"There is no clear sign of {cleaned}."
+
+    def _use_inventory_item(
+        self,
+        target: str,
+        world: World,
+        player: Player,
+        location: Location | None,
+        director: Director,
+        memory: CampaignMemory,
+        memory_context: list[str],
+    ) -> CommandResult:
+        cleaned = self._clean_item_name(target)
+        if not cleaned:
+            return CommandResult("Use what?")
+        if not self._matches_known_object(cleaned, player.inventory):
+            return CommandResult(f"You do not have {cleaned}.")
+        if cleaned in {"rations", "snack", "food"}:
+            heal = self.random.randint(1, 3)
+            player.hp = min(player.max_hp, player.hp + heal)
+            player.inventory.remove(next(item for item in player.inventory if self._clean_item_name(item) == cleaned))
+            memory.remember(
+                "item",
+                f"{player.name}:{cleaned}:{world.tick}",
+                f"{player.name} used {cleaned} and recovered {heal} HP.",
+                world.tick,
+                importance=6,
+                tags=[player.name, cleaned, "item"],
+            )
+            return CommandResult(f"You use {cleaned} and recover {heal} HP.", advance_time=True)
+        if cleaned in {"torch", "light source"}:
+            world.current_activity = "exploration"
+            world.last_roll = "Item use: light is steady and the scene is easier to read."
+            memory.remember(
+                "item",
+                f"{player.name}:{cleaned}:{world.tick}",
+                f"{player.name} used {cleaned} to improve visibility.",
+                world.tick,
+                importance=6,
+                tags=[player.name, cleaned, "item"],
+            )
+            return CommandResult(f"You ready the {cleaned}. The dark is easier to read now.", advance_time=True)
+        description = world.inventory_descriptions.get(cleaned)
+        if description:
+            memory.remember(
+                "item",
+                f"{player.name}:{cleaned}:{world.tick}",
+                f"{player.name} used {cleaned}.",
+                world.tick,
+                importance=5,
+                tags=[player.name, cleaned, "item"],
+            )
+            beat = director.respond_to_freeform_action(world, player, f"use {cleaned}", location, None, memory_context)
+            return CommandResult(f"{description} {beat.narration}", advance_time=True)
+        return CommandResult(f"You use {cleaned}, but it does not do anything obvious.")
+
+    def _drop_inventory_item(
+        self,
+        target: str,
+        world: World,
+        player: Player,
+        location: Location | None,
+        director: Director,
+        memory: CampaignMemory,
+    ) -> CommandResult:
+        cleaned = self._clean_item_name(target)
+        if not cleaned:
+            return CommandResult("Drop what?")
+        for index, item in enumerate(list(player.inventory)):
+            if not self._matches_known_object(cleaned, [item]):
+                continue
+            player.inventory.pop(index)
+            self._remember_scene_objects(world, player.position, [item])
+            self._set_object_state(world, player.position, item, status="dropped", tick=world.tick, owner=player.name)
+            memory.remember(
+                "item",
+                f"{player.name}:{cleaned}:{world.tick}:drop",
+                f"{player.name} dropped {item}.",
+                world.tick,
+                importance=5,
+                tags=[player.name, cleaned, "item"],
+            )
+            place = location.name if location else "the ground"
+            return CommandResult(f"You drop {item} at {place}.", advance_time=True)
+        return CommandResult(f"You do not have {cleaned}.")
 
     def _move_player(self, direction: str, world: World, player: Player) -> CommandResult:
         offsets = {"north": (0, -1), "south": (0, 1), "east": (1, 0), "west": (-1, 0)}

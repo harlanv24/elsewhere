@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -56,6 +57,7 @@ class Session:
     memory: CampaignMemory
     last_message: str
     transcript: list[str] = field(default_factory=list)
+    last_command: str | None = None
     selected_area: str | None = None
     entered_area: str | None = None
     entered_area_step: int = 0
@@ -63,6 +65,7 @@ class Session:
     entered_area_theme: str | None = None
     entered_area_hazard: str | None = None
     entered_area_npc: str | None = None
+    area_exit_open: bool = False
 
 
 def _partial_json_string_field(text: str, field: str) -> str | None:
@@ -211,7 +214,7 @@ class ChoiceCard(Static):
     can_focus = True
 
     def __init__(self, choice_index: int, label: str = "", **kwargs) -> None:
-        super().__init__(label, **kwargs)
+        super().__init__(label, expand=True, shrink=True, markup=False, **kwargs)
         self.choice_index = choice_index
 
     def on_click(self, event: Click) -> None:
@@ -279,7 +282,7 @@ class WorldSimApp(App[None]):
     def _compose_landing_screen(self) -> ComposeResult:
         with Container(id="landing-screen"):
             with Vertical(id="landing-card"):
-                yield Static("WORLDSIM", id="landing-title")
+                yield Static(self._elsewhere_banner(), id="landing-title")
                 yield Static(self._save_blurb(), id="save-summary")
                 with Horizontal(id="landing-actions"):
                     yield Button("Continue Save", id="continue-button", variant="primary", disabled=self.loaded_session is None)
@@ -294,7 +297,7 @@ class WorldSimApp(App[None]):
         )
         with Container(id="setup-screen"):
             with Vertical(id="setup-card"):
-                yield Static("WORLDGEN // ADVENTURE CAMPAIGN", id="setup-title")
+                yield Static(self._elsewhere_banner(), id="setup-title")
                 yield Static(subtitle, id="setup-subtitle")
                 with Vertical(id="setup-inputs"):
                     yield Input(placeholder="Name", value="Rowan", id="name-input")
@@ -325,8 +328,8 @@ class WorldSimApp(App[None]):
             with TabbedContent(initial="tab-world"):
                 with TabPane("WORLD", id="tab-world"):
                     with Horizontal(classes="row"):
-                        yield MapPanel(id="map-panel", classes="panel")
-                        with Vertical(classes="stack play-sidebar"):
+                        yield MapPanel(id="map-panel", classes="panel world-map")
+                        with Vertical(classes="world-main"):
                             yield Static(id="local-panel", classes="panel")
                             with Vertical(id="director-panel", classes="panel"):
                                 yield Static(id="director-text")
@@ -335,18 +338,23 @@ class WorldSimApp(App[None]):
                                     yield Input(placeholder="Type an action, dialogue, or command", id="adventure-command-input")
                                     yield Button("Send", id="adventure-send-button", compact=True)
                                     yield Button("Quit", id="game-quit-button", compact=True)
-                        with Vertical(classes="stack"):
+                                with Horizontal(id="inventory-quick-bar"):
+                                    yield Static(id="selected-item-panel")
+                                    yield Button("Prev Item", id="selected-inventory-prev", compact=True)
+                                    yield Button("Next Item", id="selected-inventory-next", compact=True)
+                                    yield Button("Use Item", id="use-selected-inventory", compact=True, variant="primary")
+                                    yield Button("Inspect Item", id="inspect-selected-inventory", compact=True)
                             with Vertical(id="actions-panel", classes="panel"):
                                 yield Static("Choices", id="choice-title")
                                 for index in range(4):
                                     yield ChoiceCard(index, "Choice", id=f"choice-card-{index}")
-                        with Vertical(classes="stack world-sidebar"):
+                        with Vertical(classes="world-sidebar"):
                             yield Static(id="region-panel", classes="panel")
                             yield Static(id="events-panel", classes="panel")
                             yield Static(id="alerts-panel", classes="panel")
                             yield Static(id="summary-panel", classes="panel")
                 with TabPane("MAP", id="tab-map"):
-                    with Vertical(classes="stack map-tab"):
+                    with Vertical(classes="map-tab"):
                         yield MapPanel(id="overview-map-panel", classes="panel")
                         yield Static("Press `m` to return to the world view.", id="map-tab-note")
                 with TabPane("CHARACTER", id="tab-character"):
@@ -420,6 +428,18 @@ class WorldSimApp(App[None]):
             return
         if button_id == "adventure-send-button":
             self._submit_command_input("#adventure-command-input")
+            return
+        if button_id == "selected-inventory-prev":
+            self._select_inventory_step(-1)
+            return
+        if button_id == "selected-inventory-next":
+            self._select_inventory_step(1)
+            return
+        if button_id == "use-selected-inventory":
+            self._use_selected_inventory_item()
+            return
+        if button_id == "inspect-selected-inventory":
+            self._inspect_selected_inventory_item()
             return
         if button_id == "start-button":
             self._start_new_campaign()
@@ -636,6 +656,22 @@ class WorldSimApp(App[None]):
                 f"Quest: {world.overarching_quest}",
             ]
         )
+
+    def _elsewhere_banner(self) -> Text:
+        banner = "\n".join(
+            [
+                " _______ _       _______ _______ _______ _     _ _______ _______ _______ _______",
+                "|______| |      |   |   |_____| |______ |_____| |_____| |______ |______ |______",
+                "|       | |_____ |   |   |     | ______| |   |   ______| |______ |______ ______|",
+                "",
+                "  _______  _______  _______  _______  _______  _______  _______  _______",
+                " |   ____||   ____||   ____||   ____||   ____||   ____||   ____||   ____|",
+                " |  |____ |  |____ |  |____ |  |____ |  |____ |  |____ |  |____ |  |____",
+                " |____   ||____   ||____   ||____   ||____   ||____   ||____   ||____   |",
+                "  ____|  | ____|  | ____|  | ____|  | ____|  | ____|  | ____|  | ____|  |",
+            ]
+        )
+        return Text(banner, style="bold #f8d774")
 
     def _start_new_campaign(self) -> None:
         if self.command_in_progress:
@@ -891,6 +927,7 @@ class WorldSimApp(App[None]):
         if self.command_in_progress:
             self._append_transcript("System: Still waiting on the current LLM response.")
             return
+        self.session.last_command = command
         self.command_in_progress = True
         self.stream_buffer = ""
         self._start_loading_animation(command, context="Resolving turn")
@@ -924,6 +961,7 @@ class WorldSimApp(App[None]):
             return
         self._sync_usage_totals(self.session.world)
         self.session.last_message = result.message
+        self._update_area_exit_state()
         self._append_transcript(f"DM: {result.message}")
         self.store.save(self.session.world, self.session.player, self.session.memory)
         if self.follow_player:
@@ -1014,6 +1052,7 @@ class WorldSimApp(App[None]):
         self._refresh_choice_buttons()
         self.query_one("#local-panel", Static).update(self._local_text(location, npc, memory))
         self.query_one("#director-text", Static).update(self.session.last_message)
+        self.query_one("#selected-item-panel", Static).update(self._selected_inventory_text(player))
         self._refresh_inventory_buttons(player)
         self.query_one("#resources-panel", Static).update(self._resources_text(player, world))
         self.query_one("#loadout-panel", Static).update(self._inventory_detail_text(player))
@@ -1128,7 +1167,7 @@ class WorldSimApp(App[None]):
             alerts.insert(0, f"Movement locked: {world.movement_lock}")
         if world.last_roll:
             alerts.append(world.last_roll)
-        return self._wrap_paragraphs("\n".join(f"- {alert}" for alert in alerts) or "No immediate alerts.", 34)
+        return "\n".join(f"- {alert}" for alert in alerts) or "No immediate alerts."
 
     def _summary_text(self, world: World) -> str:
         counts = self.engine.summary_counts(world)
@@ -1178,17 +1217,46 @@ class WorldSimApp(App[None]):
             button = self.query_one(f"#inventory-item-{index}", Button)
             if index < len(player.inventory):
                 item = player.inventory[index]
-                button.label = f"> {item.title()}" if index == self.selected_inventory_index else item.title()
+                prefix = "> " if index == self.selected_inventory_index else ""
+                category = self._inventory_category(item)
+                button.label = f"{prefix}{item.title()} [{category}]"
                 button.disabled = False
             else:
                 button.label = "Empty"
                 button.disabled = True
+
+    def _select_inventory_step(self, delta: int) -> None:
+        if self.session is None or not self.session.player.inventory:
+            return
+        self.selected_inventory_index = (self.selected_inventory_index + delta) % len(self.session.player.inventory)
+        self._refresh_ui()
 
     def _select_inventory_item(self, index: int) -> None:
         if self.session is None or not 0 <= index < len(self.session.player.inventory):
             return
         self.selected_inventory_index = index
         self._refresh_ui()
+
+    def _selected_inventory_item(self) -> str | None:
+        if self.session is None or not self.session.player.inventory:
+            return None
+        if self.selected_inventory_index >= len(self.session.player.inventory):
+            self.selected_inventory_index = 0
+        return self.session.player.inventory[self.selected_inventory_index]
+
+    def _use_selected_inventory_item(self) -> None:
+        item = self._selected_inventory_item()
+        if item is None:
+            return
+        self._append_transcript(f"> use {item}")
+        self._handle_command(f"use {item}")
+
+    def _inspect_selected_inventory_item(self) -> None:
+        item = self._selected_inventory_item()
+        if item is None:
+            return
+        self._append_transcript(f"> inspect {item}")
+        self._handle_command(f"inspect {item}")
 
     def _refresh_map_panels(self, world: World) -> None:
         for selector in ("#map-panel", "#overview-map-panel"):
@@ -1204,8 +1272,59 @@ class WorldSimApp(App[None]):
             return "No item selected."
         item = player.inventory[self.selected_inventory_index]
         descriptions = self.session.world.inventory_descriptions if self.session is not None else {}
-        lines = [item.title(), "", descriptions.get(item, "A carried item with no special notes yet.")]
-        return self._wrap_paragraphs("\n".join(lines), 34)
+        category = self._inventory_category(item)
+        lines = [
+            f"[bold #f8d774]{item.title()}[/] [dim]({category})[/]",
+            "",
+            descriptions.get(item, "A carried item with no special notes yet."),
+            "",
+            "[bold]Actions:[/] use, inspect, drop, or mention the item in a command.",
+        ]
+        return Text.from_markup("\n".join(lines))
+
+    def _selected_inventory_text(self, player: Player) -> Text:
+        if not player.inventory:
+            return Text.from_markup("[dim]No carried items.[/]")
+        item = player.inventory[self.selected_inventory_index]
+        description = ""
+        if self.session is not None:
+            description = self.session.world.inventory_descriptions.get(item, "")
+        lines = [
+            f"[bold #f8d774]Selected:[/] {self._styled_item_name(item, inventory=True)}",
+            f"[dim]Category:[/] {escape(self._inventory_category(item))}",
+        ]
+        if description:
+            lines.append(f"[dim]{escape(description)}[/]")
+        lines.append("[dim]Use it with the button or type `use <item>`.[/]")
+        return Text.from_markup("\n".join(lines))
+
+    def _styled_item_name(self, item: str, inventory: bool = False) -> str:
+        category = self._inventory_category(item)
+        if category == "quest":
+            style = "bold #34d399"
+        elif category == "light":
+            style = "bold #fbbf24"
+        elif category == "consumable":
+            style = "bold #f472b6"
+        elif category == "tool":
+            style = "bold #93c5fd"
+        elif inventory:
+            style = "bold #e5e7eb"
+        else:
+            style = "bold #67e8f9"
+        return f"[{style}]{escape(item.title())}[/]"
+
+    def _inventory_category(self, item: str) -> str:
+        token = item.lower()
+        if any(keyword in token for keyword in {"key", "map", "ledger", "note", "sigil", "badge", "token", "relic"}):
+            return "quest"
+        if any(keyword in token for keyword in {"torch", "lamp", "light"}):
+            return "light"
+        if any(keyword in token for keyword in {"rations", "snack", "food", "water", "drink"}):
+            return "consumable"
+        if any(keyword in token for keyword in {"rope", "hook", "kit", "lockpick", "tool"}):
+            return "tool"
+        return "utility"
 
     def _resources_text(self, player: Player, world: World) -> str:
         return self._wrap_paragraphs(
@@ -1430,41 +1549,48 @@ class WorldSimApp(App[None]):
         if self.session.entered_area is not None:
             lines.extend(
                 [
-                    f"Entered Area: {self._display_area(self.session.entered_area)}",
-                    self._area_scene_text(location),
+                    f"[bold #f8d774]Entered Area:[/] [bold #67e8f9]{escape(self._display_area(self.session.entered_area))}[/]",
+                    f"[dim]{escape(self._area_scene_text(location))}[/]",
                     "",
                 ]
             )
         elif self.session.selected_area is not None:
             lines.extend(
                 [
-                    f"Selected Area: {self._display_area(self.session.selected_area)}",
-                    "Press Enter Area or click the button to drop into this scene.",
+                    f"[bold #f8d774]Selected Area:[/] [bold #67e8f9]{escape(self._display_area(self.session.selected_area))}[/]",
+                    "[dim]Press Enter Area or click the button to drop into this scene.[/]",
                     "",
                 ]
             )
         if npc is not None:
             lines.extend(
                 [
-                    f"NPC: {npc.name}",
-                    f"Role: {npc.role}",
-                    f"Disposition: {npc.disposition}",
+                    f"[bold #f8d774]NPC:[/] [bold #93c5fd]{escape(npc.name)}[/]",
+                    f"Role: {escape(npc.role)}",
+                    f"Disposition: {escape(npc.disposition)}",
                     "",
                 ]
             )
             history = world.conversations.get(npc.name, [])[-6:]
             if history:
-                lines.append("Conversation:")
-                lines.extend(history)
+                lines.append("[bold #f8d774]Conversation:[/]")
+                lines.extend(escape(line) for line in history)
                 lines.append("")
         visible_objects = world.scene_objects.get(f"{player.position.x},{player.position.y}", [])
         if visible_objects:
-            lines.append("Visible objects:")
-            lines.extend(f"- {item}" for item in visible_objects)
+            lines.append("[bold #a7f3d0]Visible objects:[/]")
+            lines.extend(f"- {self._styled_item_name(item)}" for item in visible_objects)
             lines.append("")
-        lines.append("Relevant memory:")
-        lines.extend(memory_lines or ["No strong local memories yet."])
-        return self._wrap_paragraphs("\n".join(lines), 34)
+        if player.inventory:
+            lines.append("[bold #a7f3d0]Inventory:[/]")
+            for item in player.inventory[:6]:
+                lines.append(f"- {self._styled_item_name(item, inventory=True)} [dim]({self._inventory_category(item)})[/]")
+            lines.append("")
+        lines.append("[bold #f8d774]Relevant memory:[/]")
+        lines.extend(escape(line) for line in (memory_lines or ["No strong local memories yet."]))
+        lines.append("")
+        lines.append("[dim]Try:[/] take <item>, inspect <item>, use <item>, drop <item>.")
+        return Text.from_markup("\n".join(lines))
 
     def _chronicle_text(self, world: World) -> str:
         lines = []
@@ -1472,7 +1598,7 @@ class WorldSimApp(App[None]):
             lines.append(f"[tick {event.tick}] {event.category.upper()}")
             lines.append(event.text)
             lines.append("")
-        return self._wrap_paragraphs("\n".join(lines).strip() or "The chronicle is empty.", 34)
+        return "\n".join(lines).strip() or "The chronicle is empty."
 
     def _memory_text(self, memory: CampaignMemory, world: World, player: Player) -> str:
         relevant = memory.relevant_context(world, player, limit=6)
@@ -1653,7 +1779,7 @@ class WorldSimApp(App[None]):
         panel = self.query_one("#map-panel", Static)
         width = max(8, panel.region.width - 4)
         height = max(6, panel.region.height - 2)
-        return max(8, width // 2), height
+        return min(44, max(10, width // 3)), min(24, max(8, height // 2))
 
     def _center_camera_on_player(self) -> None:
         if self.session is None:
@@ -1759,22 +1885,30 @@ class WorldSimApp(App[None]):
 
     def _refresh_choice_buttons(self) -> None:
         assert self.session is not None
-        choices = self.session.world.current_choices
+        location = self.engine.location_at(self.session.world, self.session.player.position)
+        choices = self._visible_choice_labels(location)
         for index in range(4):
             button = self.query_one(f"#choice-card-{index}", ChoiceCard)
             if index < len(choices):
-                button.update(self._wrap_paragraphs(choices[index], 34))
+                button.update(choices[index])
                 button.disabled = False
             else:
                 button.update("No choice")
                 button.disabled = True
 
     def _select_story_choice(self, index: int) -> None:
-        if self.session is None or not 0 <= index < len(self.session.world.current_choices):
+        if self.session is None:
             return
-        choice = self.session.world.current_choices[index]
+        location = self.engine.location_at(self.session.world, self.session.player.position)
+        choices = self._visible_choice_labels(location)
+        if not 0 <= index < len(choices):
+            return
+        choice = choices[index]
         self._append_transcript(f"> {choice}")
-        self._handle_command(choice)
+        if self.session.entered_area is not None:
+            self._handle_area_choice(choice)
+        else:
+            self._handle_command(choice)
 
     def action_select_choice(self, index: int) -> None:
         self._select_story_choice(index)
@@ -1796,6 +1930,7 @@ class WorldSimApp(App[None]):
         self.session.entered_area_theme = self._area_theme()
         self.session.entered_area_hazard = self._area_hazard()
         self.session.entered_area_npc = self._area_npc()
+        self.session.area_exit_open = False
         self.session.last_message = f"You enter {self.session.entered_area}."
         self._append_transcript(f"System: {self.session.last_message}")
         self._refresh_ui()
@@ -1804,15 +1939,36 @@ class WorldSimApp(App[None]):
         if self.session is None or self.session.entered_area is None:
             return
         area_name = self.session.entered_area
+        self._step_out_of_location()
         self.session.entered_area = None
         self.session.entered_area_step = 0
         self.session.entered_area_tension = 0
         self.session.entered_area_theme = None
         self.session.entered_area_hazard = None
         self.session.entered_area_npc = None
-        self.session.last_message = f"You leave {area_name}."
+        self.session.area_exit_open = False
+        self.session.last_message = f"You leave {area_name} and step back onto the map."
         self._append_transcript(f"System: {self.session.last_message}")
         self._refresh_ui()
+
+    def _step_out_of_location(self) -> None:
+        if self.session is None:
+            return
+        world = self.session.world
+        player = self.session.player
+        current_location = self.engine.location_at(world, player.position)
+        offsets = [(0, -1), (1, 0), (0, 1), (-1, 0), (1, -1), (1, 1), (-1, 1), (-1, -1)]
+        for dx, dy in offsets:
+            candidate = Position(player.position.x + dx, player.position.y + dy)
+            if not (0 <= candidate.x < world.width and 0 <= candidate.y < world.height):
+                continue
+            if not self.engine.passable(world, candidate):
+                continue
+            candidate_location = self.engine.location_at(world, candidate)
+            if current_location is not None and candidate_location is not None and candidate_location.name == current_location.name:
+                continue
+            player.position = candidate
+            return
 
     def _area_choices(self, location: Location | None) -> list[str]:
         assert self.session is not None
@@ -1865,6 +2021,87 @@ class WorldSimApp(App[None]):
         self.session.entered_area_tension = min(9, self.session.entered_area_tension + 1)
         self._append_transcript(f"DM: {self.session.last_message}")
         self._refresh_ui()
+
+    def _last_roll_succeeded(self) -> bool:
+        if self.session is None:
+            return False
+        last_roll = self.session.world.last_roll or ""
+        return "-> success" in last_roll.lower()
+
+    def _visible_choice_labels(self, location: Location | None) -> list[str]:
+        assert self.session is not None
+        if self.session.entered_area is None:
+            return list(self.session.world.current_choices[:4])
+        area_choices = self._area_choice_labels(location)
+        merged: list[str] = []
+        for choice in area_choices + list(self.session.world.current_choices):
+            cleaned = " ".join(choice.split())
+            if not cleaned or cleaned in merged:
+                continue
+            merged.append(cleaned)
+            if len(merged) >= 4:
+                break
+        return merged
+
+    def _area_choice_labels(self, location: Location | None) -> list[str]:
+        assert self.session is not None
+        choices: list[str] = []
+        if self.session.area_exit_open or (self._last_roll_succeeded() and self.session.world.movement_lock is None):
+            choices.append("leave area")
+        else:
+            choices.append("force the exit")
+        if self.session.entered_area_step < 2:
+            choices.append("push deeper")
+        elif self.session.entered_area_step > 0:
+            choices.append("pull back")
+        choices.append("inspect the scene")
+        if self.session.entered_area_npc is not None:
+            choices.append("talk")
+        elif location is not None and location.danger > 0:
+            choices.append("press the advantage")
+        else:
+            choices.append("reassess")
+        return choices
+
+    def _update_area_exit_state(self) -> None:
+        if self.session is None or self.session.entered_area is None:
+            return
+        if self.session.world.movement_lock is not None:
+            self.session.area_exit_open = False
+            return
+        if self._last_roll_succeeded():
+            self.session.area_exit_open = True
+
+    def _handle_area_choice(self, choice: str) -> None:
+        cleaned = " ".join(choice.lower().split())
+        if cleaned == "leave area":
+            if self.session is not None and (self.session.area_exit_open or self.session.world.movement_lock is None):
+                self._leave_area()
+            else:
+                self._try_leave_area()
+            return
+        if cleaned == "force the exit":
+            self._try_leave_area()
+            return
+        if cleaned == "push deeper":
+            self._move_within_area(1)
+            return
+        if cleaned == "pull back":
+            self._move_within_area(-1)
+            return
+        if cleaned in {"inspect the scene", "search carefully", "look around"}:
+            self._handle_area_action("look")
+            return
+        if cleaned == "talk":
+            self._handle_area_action("talk")
+            return
+        if cleaned == "press the advantage":
+            self._handle_command("attack")
+            return
+        if cleaned == "reassess":
+            self._handle_area_action("look")
+            return
+        self._handle_command(choice)
 
     def _handle_area_action(self, command: str) -> None:
         if self.session is None:

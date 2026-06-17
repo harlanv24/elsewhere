@@ -256,6 +256,7 @@ def director_context(
             "visible_scene_objects": _scene_objects_at(world, player) if player is not None else [],
             "object_states_here": _object_states_for_position(world, position_key),
             "player_inventory": list(player.inventory) if player is not None else [],
+            "player_inventory_details": _inventory_details(world, player) if player is not None else [],
             "player_boosts": dict(player.boosts) if player is not None else {},
             "recent_state_facts": _compact_lines(world.state_facts[-12:], 180),
             "npc_conversation_history": _compact_lines(world.conversations.get(npc.name, [])[-10:], 180)
@@ -519,6 +520,19 @@ def _object_states_for_position(world: World, position_key: str | None) -> dict[
     }
 
 
+def _inventory_details(world: World, player: Player) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for item in player.inventory:
+        details.append(
+            {
+                "name": item,
+                "description": world.inventory_descriptions.get(item, ""),
+                "category": _inventory_category(item),
+            }
+        )
+    return details
+
+
 def _npc_prior_replies(world: World, npc: Npc) -> list[str]:
     prefix = f"{npc.name}:"
     replies: list[str] = []
@@ -597,6 +611,19 @@ def _compact_lines(lines: list[str], max_length: int) -> list[str]:
             normalized = normalized[: max_length - 3].rstrip() + "..."
         compacted.append(normalized)
     return compacted
+
+
+def _inventory_category(item: str) -> str:
+    token = item.lower()
+    if any(keyword in token for keyword in {"key", "map", "ledger", "note", "sigil", "badge", "token", "relic"}):
+        return "quest"
+    if any(keyword in token for keyword in {"torch", "lamp", "light"}):
+        return "light"
+    if any(keyword in token for keyword in {"rations", "snack", "food", "water", "drink"}):
+        return "consumable"
+    if any(keyword in token for keyword in {"rope", "hook", "kit", "lockpick", "tool"}):
+        return "tool"
+    return "utility"
 
 
 def _required_string(payload: dict[str, object], key: str) -> str:

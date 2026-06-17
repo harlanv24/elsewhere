@@ -28,6 +28,8 @@ You may:
 - name locations, NPCs, landmarks, factions, relics, rumors
 - frame scenes and present opportunities
 - suggest a check, risk, or consequence using structured intent
+- treat visible scene objects and carried inventory as first-class story elements
+- mention how items, tools, and objects matter in the current situation when they are present
 
 You may not:
 - decide dice outcomes
@@ -139,8 +141,13 @@ class MockDirector(Director):
         npc: Npc | None,
         memory_context: list[str] | None = None,
     ) -> str:
+        visible_items = world.scene_objects.get(f"{player.position.x},{player.position.y}", [])
         if location is None:
             text = "The wilderness is quiet here, but not empty. Tracks and weather argue over which story matters most."
+            if visible_items:
+                text += f" Nearby objects: {', '.join(item.title() for item in visible_items[:3])}."
+            if player.inventory:
+                text += f" You are carrying: {', '.join(item.title() for item in player.inventory[:3])}."
             if memory_context:
                 text += f" A remembered thread returns: {memory_context[0]}"
             return text
@@ -153,6 +160,10 @@ class MockDirector(Director):
         note = self.random.choice(details)
         if npc is not None:
             note += f" {npc.name}, a {npc.disposition} {npc.role}, is nearby."
+        if visible_items:
+            note += f" Visible objects here: {', '.join(item.title() for item in visible_items[:3])}."
+        if player.inventory:
+            note += f" You carry: {', '.join(item.title() for item in player.inventory[:3])}."
         if memory_context:
             note += f" You recall: {memory_context[0]}"
         return note
@@ -167,6 +178,7 @@ class MockDirector(Director):
         memory_context: list[str] | None = None,
     ) -> DirectorBeat:
         memory_line = f" Memory leans on the moment: {memory_context[0]}" if memory_context else ""
+        visible_items = world.scene_objects.get(f"{player.position.x},{player.position.y}", [])
         if action == "explore":
             title = "Field Discovery"
             place = location.name if location else "the wilds"
@@ -187,6 +199,7 @@ class MockDirector(Director):
                 difficulty=9 + (location.danger if location else 2),
                 tags=["exploration", "discovery"],
                 follow_up_hook=self.random.choice(hooks),
+                scene_objects=visible_items[:4],
             )
 
         if action == "talk":
@@ -210,6 +223,7 @@ class MockDirector(Director):
                 difficulty=8,
                 tags=["social", "rumor"],
                 follow_up_hook=f"{npc.name} might know more if you prove useful.",
+                scene_objects=visible_items[:4],
             )
 
         if action == "attack":
@@ -220,6 +234,7 @@ class MockDirector(Director):
                 difficulty=10 + (location.danger if location else 3),
                 tags=["combat"],
                 follow_up_hook="Victory here will reshape how this place speaks about you.",
+                scene_objects=visible_items[:4],
             )
 
         if action == "rest":
@@ -228,6 +243,7 @@ class MockDirector(Director):
                 narration="You take a careful pause, listening for the difference between silence and danger." + memory_line,
                 mechanical_request=None,
                 tags=["rest"],
+                scene_objects=visible_items[:4],
             )
 
         return DirectorBeat(
@@ -235,6 +251,7 @@ class MockDirector(Director):
             narration="The world keeps moving, whether watched closely or not." + memory_line,
             mechanical_request=None,
             tags=["time"],
+            scene_objects=visible_items[:4],
         )
 
     def ambient_world_event(self, world: World) -> str:
@@ -256,14 +273,19 @@ class MockDirector(Director):
         npc: Npc | None,
         memory_context: list[str] | None = None,
     ) -> DirectorBeat:
-        del world, player, memory_context
+        visible_items = world.scene_objects.get(f"{player.position.x},{player.position.y}", [])
         place = location.name if location else "the frontier"
+        item_clause = ""
+        if visible_items:
+            item_clause = f" Visible objects include {', '.join(item.title() for item in visible_items[:3])}."
+        if player.inventory:
+            item_clause += f" Carried items include {', '.join(item.title() for item in player.inventory[:3])}."
         return DirectorBeat(
             title="Improvised Action",
-            narration=f"You try to {action} around {place}. The moment shifts, but nothing certain gives way yet.",
+            narration=f"You try to {action} around {place}.{item_clause} The moment shifts, but nothing certain gives way yet.",
             mechanical_request=None,
             tags=["freeform"],
-            scene_objects=[],
+            scene_objects=visible_items[:4],
         )
 
     def respond_to_dialogue(
@@ -503,7 +525,9 @@ def _llm_system_prompt() -> str:
         "Request mechanical_request and difficulty for uncertainty: exploration_check for search, traversal, lore, hazards; social_check for persuasion, deception, intimidation, insight, negotiation; combat_check for violence, chases under threat, and direct physical danger. "
         "For dialogue, reply in character to player_dialogue, match the theme's style and social rules, use conversation history as authoritative state, avoid repeated prior NPC replies, and move stalled conversations toward a decision or action. "
         "For freeform actions, resolve the exact attempted action against state_ledger and visible_scene_objects. Do not reintroduce removed, destroyed, or in_inventory objects. "
-        "If an action reveals objects, list them in scene_objects. If the player takes a small visible portable object, list it in inventory_add. If the player uses or consumes an inventory item, list it in inventory_remove."
+        "Treat player_inventory_details as concrete carried props and mention them when relevant to the scene. "
+        "If an action reveals objects, list them in scene_objects. If the player takes a small visible portable object, list it in inventory_add. If the player uses or consumes an inventory item, list it in inventory_remove. "
+        "Prefer choices that reference actual items, scene objects, and location details instead of generic filler."
     )
 
 

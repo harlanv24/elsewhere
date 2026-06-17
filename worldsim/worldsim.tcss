@@ -191,6 +191,13 @@ TabPane {
     overflow: hidden auto;
 }
 
+.panel Static,
+.panel RichLog {
+    width: 100%;
+    overflow: auto auto;
+    text-wrap: wrap;
+}
+
 #map-panel {
     width: 1fr;
     height: 100%;
@@ -240,6 +247,29 @@ TabPane {
 #actions-panel {
     height: 1fr;
     overflow: hidden auto;
+}
+
+#actions-panel ChoiceCard {
+    width: 100%;
+    min-height: 4;
+    height: auto;
+    margin-bottom: 1;
+    padding: 0 1;
+    border: round #475569;
+    background: #0f172a;
+    color: #e5e7eb;
+    content-align: left top;
+    text-wrap: wrap;
+    overflow: auto auto;
+}
+
+#actions-panel ChoiceCard:hover {
+    border: round #f8d774;
+    background: #1e293b;
+}
+
+#actions-panel ChoiceCard:focus {
+    border: round #f8d774;
 }
 
 #inventory-panel Button,

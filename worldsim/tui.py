@@ -207,6 +207,18 @@ class MapPanel(Static):
         self.app.action_toggle_follow()
 
 
+class ChoiceCard(Static):
+    can_focus = True
+
+    def __init__(self, choice_index: int, label: str = "", **kwargs) -> None:
+        super().__init__(label, **kwargs)
+        self.choice_index = choice_index
+
+    def on_click(self, event: Click) -> None:
+        del event
+        self.app.action_select_choice(self.choice_index)
+
+
 class WorldSimApp(App[None]):
     CSS_PATH = "worldsim.tcss"
     BINDINGS = [
@@ -327,7 +339,7 @@ class WorldSimApp(App[None]):
                             with Vertical(id="actions-panel", classes="panel"):
                                 yield Static("Choices", id="choice-title")
                                 for index in range(4):
-                                    yield Button("Choice", id=f"choice-btn-{index}")
+                                    yield ChoiceCard(index, "Choice", id=f"choice-card-{index}")
                         with Vertical(classes="stack world-sidebar"):
                             yield Static(id="region-panel", classes="panel")
                             yield Static(id="events-panel", classes="panel")
@@ -418,7 +430,7 @@ class WorldSimApp(App[None]):
         if button_id.startswith("homeland-option-"):
             self._select_generated_homeland(int(button_id.rsplit("-", 1)[1]))
             return
-        if button_id.startswith("choice-btn-"):
+        if button_id.startswith("choice-card-"):
             self._select_story_choice(int(button_id.rsplit("-", 1)[1]))
             return
         if button_id.startswith("inventory-item-"):
@@ -1749,12 +1761,12 @@ class WorldSimApp(App[None]):
         assert self.session is not None
         choices = self.session.world.current_choices
         for index in range(4):
-            button = self.query_one(f"#choice-btn-{index}", Button)
+            button = self.query_one(f"#choice-card-{index}", ChoiceCard)
             if index < len(choices):
-                button.label = choices[index]
+                button.update(self._wrap_paragraphs(choices[index], 34))
                 button.disabled = False
             else:
-                button.label = "No choice"
+                button.update("No choice")
                 button.disabled = True
 
     def _select_story_choice(self, index: int) -> None:
@@ -1763,6 +1775,9 @@ class WorldSimApp(App[None]):
         choice = self.session.world.current_choices[index]
         self._append_transcript(f"> {choice}")
         self._handle_command(choice)
+
+    def action_select_choice(self, index: int) -> None:
+        self._select_story_choice(index)
 
     def _select_area(self, index: int) -> None:
         if self.session is None or not (0 <= index < len(self.area_choices)):

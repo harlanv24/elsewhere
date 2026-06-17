@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from worldsim.usage import UsageTotals
+
 
 class Biome(str, Enum):
     WATER = "Water"
@@ -70,6 +72,31 @@ class Event:
 
 
 @dataclass
+class Quest:
+    id: str
+    title: str
+    goal: str
+    stages: list[str]
+    current_stage: int = 0
+    progress: int = 0
+    progress_required: int = 2
+    status: str = "active"
+    related_locations: list[str] = field(default_factory=list)
+    related_npcs: list[str] = field(default_factory=list)
+    discoveries: list[str] = field(default_factory=list)
+
+
+@dataclass
+class QuestClock:
+    id: str
+    title: str
+    value: int = 0
+    max_value: int = 6
+    description: str = ""
+    status: str = "active"
+
+
+@dataclass
 class DirectorBeat:
     title: str
     narration: str
@@ -81,6 +108,10 @@ class DirectorBeat:
     inventory_add: list[str] = field(default_factory=list)
     inventory_remove: list[str] = field(default_factory=list)
     choices: list[str] = field(default_factory=list)
+    progress_summary: str | None = None
+    quest_progress_delta: int = 0
+    complete_current_stage: bool = False
+    clock_effects: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -101,10 +132,14 @@ class World:
     state_facts: list[str] = field(default_factory=list)
     weather: str = "Clear"
     stability: int = 70
-    theme_prompt: str = "grounded fantasy frontier"
+    theme_prompt: str = "character-driven adventure"
     campaign_title: str = "Untitled Frontier"
     overarching_quest: str = "Uncover the central threat shaping the frontier."
     active_quest: str | None = None
+    active_quest_id: str | None = None
+    quests: list[Quest] = field(default_factory=list)
+    clocks: list[QuestClock] = field(default_factory=list)
+    usage_totals: UsageTotals = field(default_factory=UsageTotals)
     current_choices: list[str] = field(default_factory=list)
     current_activity: str | None = None
     movement_lock: str | None = None
@@ -113,6 +148,10 @@ class World:
     player_archetype_blurbs: dict[str, str] = field(default_factory=dict)
     player_archetype_boosts: dict[str, dict[str, int]] = field(default_factory=dict)
     homeland_options: list[str] = field(default_factory=list)
+    starting_inventory: list[str] = field(default_factory=lambda: ["notebook", "light source", "snack"])
+    inventory_descriptions: dict[str, str] = field(default_factory=dict)
+    skill_descriptions: dict[str, str] = field(default_factory=dict)
+    homeland_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

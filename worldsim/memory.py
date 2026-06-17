@@ -4,7 +4,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from worldsim.models import Biome, Event, Location, Npc, Player, Position, World
+from worldsim.models import Biome, Event, Location, Npc, Player, Position, Quest, QuestClock, World
+from worldsim.usage import UsageTotals
 
 
 @dataclass
@@ -90,7 +91,7 @@ class CampaignMemory:
         self.remember(
             "campaign",
             "overarching_quest",
-            f"{world.campaign_title}: {world.overarching_quest}",
+            f"{world.campaign_title}: {world.overarching_quest}. Current objective: {world.active_quest or 'none'}.",
             world.tick,
             importance=9,
             tags=["campaign", "quest", world.campaign_title],
@@ -195,6 +196,10 @@ class CampaignStore:
             "campaign_title": world.campaign_title,
             "overarching_quest": world.overarching_quest,
             "active_quest": world.active_quest,
+            "active_quest_id": world.active_quest_id,
+            "quests": [asdict(quest) for quest in world.quests],
+            "clocks": [asdict(clock) for clock in world.clocks],
+            "usage_totals": world.usage_totals.to_dict(),
             "current_choices": list(world.current_choices),
             "current_activity": world.current_activity,
             "movement_lock": world.movement_lock,
@@ -203,6 +208,10 @@ class CampaignStore:
             "player_archetype_blurbs": dict(world.player_archetype_blurbs),
             "player_archetype_boosts": dict(world.player_archetype_boosts),
             "homeland_options": list(world.homeland_options),
+            "starting_inventory": list(world.starting_inventory),
+            "inventory_descriptions": dict(world.inventory_descriptions),
+            "skill_descriptions": dict(world.skill_descriptions),
+            "homeland_descriptions": dict(world.homeland_descriptions),
         }
 
     def _deserialize_world(self, payload: dict[str, object]) -> World:
@@ -248,10 +257,14 @@ class CampaignStore:
             state_facts=list(payload.get("state_facts", [])),
             weather=payload["weather"],
             stability=payload["stability"],
-            theme_prompt=payload.get("theme_prompt", "grounded fantasy frontier"),
+            theme_prompt=payload.get("theme_prompt", "character-driven adventure"),
             campaign_title=payload.get("campaign_title", "Untitled Frontier"),
             overarching_quest=payload.get("overarching_quest", "Uncover the central threat shaping the frontier."),
             active_quest=payload.get("active_quest"),
+            active_quest_id=payload.get("active_quest_id"),
+            quests=[Quest(**quest) for quest in payload.get("quests", []) if isinstance(quest, dict)],
+            clocks=[QuestClock(**clock) for clock in payload.get("clocks", []) if isinstance(clock, dict)],
+            usage_totals=UsageTotals.from_dict(payload.get("usage_totals")),
             current_choices=list(payload.get("current_choices", [])),
             current_activity=payload.get("current_activity"),
             movement_lock=payload.get("movement_lock"),
@@ -260,6 +273,10 @@ class CampaignStore:
             player_archetype_blurbs=dict(payload.get("player_archetype_blurbs", {})),
             player_archetype_boosts=dict(payload.get("player_archetype_boosts", {})),
             homeland_options=list(payload.get("homeland_options", [])),
+            starting_inventory=list(payload.get("starting_inventory", ["notebook", "light source", "snack"])),
+            inventory_descriptions=dict(payload.get("inventory_descriptions", {})),
+            skill_descriptions=dict(payload.get("skill_descriptions", {})),
+            homeland_descriptions=dict(payload.get("homeland_descriptions", {})),
         )
 
     def _serialize_state(self, world: World, player: Player, memory: CampaignMemory) -> dict[str, object]:
@@ -270,6 +287,10 @@ class CampaignStore:
             "campaign_title": world.campaign_title,
             "overarching_quest": world.overarching_quest,
             "active_quest": world.active_quest,
+            "active_quest_id": world.active_quest_id,
+            "quests": [asdict(quest) for quest in world.quests],
+            "clocks": [asdict(clock) for clock in world.clocks],
+            "usage_totals": world.usage_totals.to_dict(),
             "current_choices": list(world.current_choices),
             "current_activity": world.current_activity,
             "movement_lock": world.movement_lock,
@@ -278,6 +299,10 @@ class CampaignStore:
             "player_archetype_blurbs": dict(world.player_archetype_blurbs),
             "player_archetype_boosts": dict(world.player_archetype_boosts),
             "homeland_options": list(world.homeland_options),
+            "starting_inventory": list(world.starting_inventory),
+            "inventory_descriptions": dict(world.inventory_descriptions),
+            "skill_descriptions": dict(world.skill_descriptions),
+            "homeland_descriptions": dict(world.homeland_descriptions),
             "player": self._serialize_player(player),
             "current_position": position_key,
             "visible_scene_objects": list(world.scene_objects.get(position_key, [])),

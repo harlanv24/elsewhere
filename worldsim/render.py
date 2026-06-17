@@ -60,7 +60,7 @@ def render_dashboard(
             f"Terrain: {engine.biome_at(world, player.position).value}",
         ]
 
-    hooks_panel = _panel("QUEST HOOKS", world.quest_hooks or ["No active hooks."], right_width, 12)
+    hooks_panel = _panel("QUESTS", _quest_lines(world), right_width, 12)
     alerts_panel = _panel("ALERTS", world.alerts or ["No immediate alerts."], right_width, 8)
     player_panel = _panel("PLAYER", _player_lines(player), right_width, 10)
     region_panel = _panel("SELECTED REGION", selected_region_lines, right_width, 12)
@@ -127,6 +127,24 @@ def _summary_lines(world: World, engine: WorldEngine) -> list[str]:
         f"Hooks: {counts['hooks']}",
         f"Stability: {world.stability}%",
     ]
+
+
+def _quest_lines(world: World) -> list[str]:
+    if not world.quests:
+        return world.quest_hooks or ["No active hooks."]
+    active = next((quest for quest in world.quests if quest.id == world.active_quest_id), world.quests[0])
+    stage = active.stages[min(active.current_stage, len(active.stages) - 1)] if active.stages else active.goal
+    lines = [
+        f"Active: {active.title}",
+        stage,
+        f"Progress: {active.progress}/{active.progress_required}",
+    ]
+    active_clocks = [clock for clock in world.clocks if clock.status == "active"]
+    if active_clocks:
+        lines.append("")
+        lines.append("Clocks:")
+        lines.extend(f"{clock.title}: {clock.value}/{clock.max_value}" for clock in active_clocks[:3])
+    return lines
 
 
 def _memory_lines(memory: CampaignMemory, world: World, player: Player) -> list[str]:

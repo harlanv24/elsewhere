@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,10 +22,30 @@ from worldsim.director import director_from_env
 from worldsim.engine import WorldEngine
 from worldsim.memory import CampaignMemory, CampaignStore
 from worldsim.models import Biome, Location, Npc, Player, Position, World
-from worldsim.usage import TokenUsageTracker, format_tokens
+from worldsim.usage import TokenUsageTracker, UsageTotals, format_tokens
 
 if TYPE_CHECKING:
     from textual.events import Click
+
+
+THINKING_VERBS = [
+    "thinking",
+    "weaving",
+    "reckoning",
+    "scrying",
+    "drafting",
+    "pondering",
+    "plotting",
+    "listening",
+    "consulting",
+    "composing",
+    "divining",
+    "tracing",
+    "weighing",
+    "shaping",
+    "attuning",
+    "remembering",
+]
 
 
 @dataclass
@@ -216,6 +237,10 @@ class WorldSimApp(App[None]):
         self.loading_timer: Timer | None = None
         self.loading_step = 0
         self.loading_theme = ""
+        self.loading_context = ""
+        self.loading_verb = ""
+        self.loading_random = random.Random()
+        self.synced_usage = UsageTotals()
         self.pending_world: World | None = None
         self.selected_archetype: str | None = None
         self.selected_homeland: str | None = None
@@ -257,12 +282,13 @@ class WorldSimApp(App[None]):
             with Vertical(id="setup-card"):
                 yield Static("WORLDGEN // ADVENTURE CAMPAIGN", id="setup-title")
                 yield Static(subtitle, id="setup-subtitle")
-                yield Input(placeholder="Name", value="Rowan", id="name-input")
-                yield Input(
-                    placeholder="World theme: haunted sky islands, political desert intrigue, etc.",
-                    value="grounded fantasy frontier with ancient ruins and uneasy settlements",
-                    id="theme-input",
-                )
+                with Vertical(id="setup-inputs"):
+                    yield Input(placeholder="Name", value="Rowan", id="name-input")
+                    yield Input(
+                        placeholder="World theme: workplace sitcom, haunted suburb, space noir, coastal mystery...",
+                        value="",
+                        id="theme-input",
+                    )
                 with Vertical(id="character-select"):
                     with Horizontal(id="selection-grid"):
                         with Vertical(id="class-options-panel"):
@@ -286,28 +312,15 @@ class WorldSimApp(App[None]):
                 with TabPane("WORLD", id="tab-world"):
                     with Horizontal(classes="row"):
                         yield MapPanel(id="map-panel", classes="panel")
-                        with Vertical(classes="stack world-sidebar"):
-                            yield Static(id="region-panel", classes="panel")
-                            yield Static(id="events-panel", classes="panel")
-                            yield Static(id="alerts-panel", classes="panel")
-                            yield Static(id="summary-panel", classes="panel")
-                with TabPane("ADVENTURE", id="tab-adventure"):
-                    with Horizontal(classes="row"):
+                        with Vertical(classes="stack play-sidebar"):
+                            yield Static(id="local-panel", classes="panel")
+                            yield Static(id="director-panel", classes="panel")
+                            with Horizontal(id="adventure-command-bar", classes="panel"):
+                                yield Static(">", id="adventure-prompt")
+                                yield Input(placeholder="Type an action, dialogue, or command", id="adventure-command-input")
+                                yield Button("Send", id="adventure-send-button", compact=True)
                         with Vertical(classes="stack"):
-                            yield Static(id="player-panel", classes="panel")
-                            yield Static(id="hooks-panel", classes="panel")
-                        with Vertical(classes="stack"):
-                            yield Static(id="areas-panel", classes="panel")
-                            with Vertical(id="area-buttons", classes="panel"):
-                                yield Button("Area Slot 1", id="area-btn-0", compact=True)
-                                yield Button("Area Slot 2", id="area-btn-1", compact=True)
-                                yield Button("Area Slot 3", id="area-btn-2", compact=True)
                             with Vertical(id="actions-panel", classes="panel"):
-                                yield Button("Enter Area", id="area-enter", variant="primary", compact=True)
-                                yield Button("Leave Area", id="area-leave", compact=True)
-                                yield Button("Step Deeper", id="area-forward", compact=True)
-                                yield Button("Step Back", id="area-back", compact=True)
-                                yield Button("Try Leave", id="area-try-leave", compact=True)
                                 yield Button("Look", id="action-look", compact=True)
                                 yield Button("Explore", id="action-explore", compact=True)
                                 yield Button("Talk", id="action-talk", compact=True)
@@ -317,43 +330,38 @@ class WorldSimApp(App[None]):
                                 yield Static("Choices", id="choice-title")
                                 for index in range(4):
                                     yield Button("Choice", id=f"choice-btn-{index}", compact=True)
-                        with Vertical(classes="stack"):
-                            yield Static(id="local-panel", classes="panel")
-                            yield Static(id="director-panel", classes="panel")
-                with TabPane("INVENTORY", id="tab-inventory"):
+                        with Vertical(classes="stack world-sidebar"):
+                            yield Static(id="region-panel", classes="panel")
+                            yield Static(id="events-panel", classes="panel")
+                            yield Static(id="alerts-panel", classes="panel")
+                            yield Static(id="summary-panel", classes="panel")
+                with TabPane("CHARACTER", id="tab-character"):
                     with Horizontal(classes="row"):
+                        with Vertical(classes="stack"):
+                            yield Static(id="player-panel", classes="panel")
+                            yield Static(id="hooks-panel", classes="panel")
+                            yield Static(id="resources-panel", classes="panel")
                         with Vertical(classes="stack"):
                             with Vertical(id="inventory-panel", classes="panel"):
                                 for index in range(8):
                                     yield Button("Item", id=f"inventory-item-{index}", compact=True)
-                            yield Static(id="resources-panel", classes="panel")
-                        with Vertical(classes="stack"):
                             yield Static(id="loadout-panel", classes="panel")
                             yield Static(id="packs-panel", classes="panel")
-                with TabPane("SKILLS", id="tab-skills"):
-                    with Horizontal(classes="row"):
                         with Vertical(classes="stack"):
                             with Vertical(id="skills-panel", classes="panel"):
                                 for index in range(8):
                                     yield Button("Skill", id=f"skill-btn-{index}", compact=True)
                             yield Static(id="progression-panel", classes="panel")
-                        with Vertical(classes="stack"):
                             yield Static(id="traits-panel", classes="panel")
                             yield Static(id="milestones-panel", classes="panel")
-                with TabPane("CHRONICLE", id="tab-chronicle"):
-                    with Horizontal(classes="row"):
-                        yield Static(id="chronicle-panel", classes="panel")
-                        yield Static(id="memory-panel", classes="panel")
                 with TabPane("SYSTEM", id="tab-system"):
                     yield Static(id="system-panel", classes="panel")
             yield RichLog(id="console-panel", classes="panel", auto_scroll=True, highlight=False, wrap=True, min_width=20)
             with Horizontal(id="command-bar"):
                 yield Static("worldsim >", id="prompt")
                 yield Input(placeholder="Enter a command or dialogue", id="command-input")
-            yield Static(
-                "Press 'm' or Esc to focus map. Arrows move. Use talk to start NPC dialogue; while speaking, prefix commands with /.",
-                id="footer-note",
-            )
+                yield Button("Quit", id="game-quit-button", compact=True)
+            yield Static(self._footer_text(), id="footer-note")
 
     def _set_panel_titles(self) -> None:
         titles = {
@@ -364,9 +372,7 @@ class WorldSimApp(App[None]):
             "#summary-panel": "WORLD SUMMARY",
             "#player-panel": "PLAYER",
             "#hooks-panel": "QUEST HOOKS",
-            "#areas-panel": "AREA OVERVIEW",
-            "#area-buttons": "AREA CHOICES",
-            "#actions-panel": "AREA ACTIONS",
+            "#actions-panel": "ACTIONS",
             "#local-panel": "LOCAL DETAILS",
             "#director-panel": "DIRECTOR",
             "#inventory-panel": "INVENTORY",
@@ -377,8 +383,6 @@ class WorldSimApp(App[None]):
             "#progression-panel": "PROGRESSION",
             "#traits-panel": "ARCHETYPE TRAITS",
             "#milestones-panel": "NEXT MILESTONES",
-            "#chronicle-panel": "SIMULATION LOG",
-            "#memory-panel": "MEMORY INDEX",
             "#system-panel": "SYSTEM NOTES",
             "#console-panel": "CONSOLE",
         }
@@ -399,6 +403,12 @@ class WorldSimApp(App[None]):
                 self._return_to_landing()
             else:
                 self.exit()
+            return
+        if button_id == "game-quit-button":
+            self.exit()
+            return
+        if button_id == "adventure-send-button":
+            self._submit_command_input("#adventure-command-input")
             return
         if button_id == "start-button":
             self._start_new_campaign()
@@ -445,13 +455,17 @@ class WorldSimApp(App[None]):
                 self._handle_command(command)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "command-input":
-            entered = event.value.strip()
-            event.input.value = ""
-            command = self._command_from_input(entered)
-            if command:
-                self._append_transcript(self._input_echo(entered, command))
-                self._handle_command(command)
+        if event.input.id in {"command-input", "adventure-command-input"}:
+            self._submit_command_input(f"#{event.input.id}")
+
+    def _submit_command_input(self, selector: str) -> None:
+        command_input = self.query_one(selector, Input)
+        entered = command_input.value.strip()
+        command_input.value = ""
+        command = self._command_from_input(entered)
+        if command:
+            self._append_transcript(self._input_echo(entered, command))
+            self._handle_command(command)
 
     def action_focus_command(self) -> None:
         if self.session is not None:
@@ -557,6 +571,7 @@ class WorldSimApp(App[None]):
         if self.loaded_session is None:
             return
         world, player, memory = self.loaded_session
+        self.engine.ensure_progression(world)
         memory.remember_world_state(world, player)
         self.session = Session(
             world=world,
@@ -582,11 +597,12 @@ class WorldSimApp(App[None]):
         if self.loaded_session is None:
             return "No saved campaign found.\nCreate a new world to begin."
         world, player, memory = self.loaded_session
+        self.engine.ensure_progression(world)
         modified = "unknown"
         if self.store.path.exists():
             modified = datetime.fromtimestamp(self.store.path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         location = self.engine.location_at(world, player.position)
-        place = location.name if location is not None else "the frontier"
+        place = location.name if location is not None else "the open map"
         return "\n".join(
             [
                 f"{world.campaign_title}",
@@ -604,10 +620,11 @@ class WorldSimApp(App[None]):
             return
         name = self.query_one("#name-input", Input).value.strip() or "Rowan"
         del name
-        theme = self.query_one("#theme-input", Input).value.strip() or "grounded fantasy frontier"
+        theme = self.query_one("#theme-input", Input).value.strip() or "character-driven adventure"
 
         self.engine = WorldEngine()
         self.director = director_from_env(self.engine.seed, self.debug_logger)
+        self.synced_usage = UsageTotals()
         self.command_in_progress = True
         self.stream_buffer = ""
         self.query_one("#setup-error", Static).update("")
@@ -628,6 +645,7 @@ class WorldSimApp(App[None]):
     def _finish_world_generation(self, world: World) -> None:
         self._clear_stream_callback()
         self._stop_loading_animation()
+        self._sync_usage_totals(world)
         self.pending_world = world
         self.selected_archetype = world.player_archetype_options[0] if world.player_archetype_options else "ranger"
         self.selected_homeland = world.homeland_options[0] if world.homeland_options else world.locations[0].name
@@ -650,6 +668,7 @@ class WorldSimApp(App[None]):
         if homeland not in self.pending_world.homeland_options:
             homeland = self.pending_world.homeland_options[0] if self.pending_world.homeland_options else self.pending_world.locations[0].name
         self.command_in_progress = True
+        self._start_loading_animation("Opening scene", context="Introducing campaign")
         self.run_worker(
             lambda: self._start_new_campaign_worker(self.pending_world, name, archetype, homeland),
             thread=True,
@@ -660,8 +679,8 @@ class WorldSimApp(App[None]):
         player = self.engine.create_player(world, name, archetype, homeland)
         memory = CampaignMemory()
         memory.remember_world_state(world, player)
-        for hook in world.quest_hooks:
-            memory.remember_hook(hook, world.tick)
+        for quest in world.quests:
+            memory.remember_hook(f"{quest.title}: {quest.goal}", world.tick)
         last_message = self.director.introduce_world(world, player, memory.relevant_context(world, player))
         session = Session(
             world=world,
@@ -684,6 +703,7 @@ class WorldSimApp(App[None]):
         self._stop_loading_animation()
         self.pending_world = None
         self.session = session
+        self._sync_usage_totals(session.world)
         self.store.save(session.world, session.player, session.memory)
         self.command_in_progress = False
         self.follow_player = True
@@ -712,7 +732,8 @@ class WorldSimApp(App[None]):
             button = self.query_one(f"#class-option-{index}", Button)
             if index < len(self.pending_world.player_archetype_options):
                 archetype = self.pending_world.player_archetype_options[index]
-                button.label = f"> {archetype}" if archetype == self.selected_archetype else archetype
+                label = self._button_label(archetype, 20)
+                button.label = f"> {label}" if archetype == self.selected_archetype else label
                 button.disabled = False
             else:
                 button.label = "Unavailable"
@@ -721,7 +742,8 @@ class WorldSimApp(App[None]):
             button = self.query_one(f"#homeland-option-{index}", Button)
             if index < len(self.pending_world.homeland_options):
                 homeland = self.pending_world.homeland_options[index]
-                button.label = f"> {homeland}" if homeland == self.selected_homeland else homeland
+                label = self._button_label(homeland, 20)
+                button.label = f"> {label}" if homeland == self.selected_homeland else label
                 button.disabled = False
             else:
                 button.label = "Unavailable"
@@ -736,14 +758,28 @@ class WorldSimApp(App[None]):
         boosts = self.pending_world.player_archetype_boosts.get(archetype, {})
         lines = [archetype.title(), "", blurb, "", "Skill Bonuses:"]
         if boosts:
-            lines.extend(f"- {self._skill_label(skill)} +{value}" for skill, value in sorted(boosts.items()) if value)
+            lines.extend(
+                f"- {self._skill_label(skill)} {self._format_bonus(value)}"
+                for skill, value in sorted(boosts.items())
+                if value
+            )
         else:
             lines.append("- No specialized bonuses listed.")
         lines.extend(["", "Homeland:", self.selected_homeland or "Choose a homeland."])
+        if self.selected_homeland:
+            description = self.pending_world.homeland_descriptions.get(self.selected_homeland)
+            if description:
+                lines.extend(["", description])
         return "\n".join(lines)
 
     def _skill_label(self, skill: str) -> str:
         return skill.replace("_", " ").title()
+
+    def _button_label(self, value: str, limit: int) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: max(1, limit - 1)].rstrip() + "..."
 
     def _generation_status_text(self, world: World) -> str:
         if not getattr(self.director, "last_used_fallback", False):
@@ -756,27 +792,63 @@ class WorldSimApp(App[None]):
             f"Debug log: {debug_path}"
         )
 
-    def _start_loading_animation(self, theme: str) -> None:
+    def _start_loading_animation(self, theme: str, context: str = "Generating world") -> None:
         self.loading_theme = theme
+        self.loading_context = context
+        self.loading_verb = self.loading_random.choice(THINKING_VERBS)
         self.loading_step = 0
-        self.query_one("#setup-subtitle", Static).update(self._loading_text())
+        self._render_loading_animation()
         if self.loading_timer is not None:
             self.loading_timer.stop()
-        self.loading_timer = self.set_interval(0.4, self._advance_loading_animation)
+        self.loading_timer = self.set_interval(0.35, self._advance_loading_animation)
 
     def _stop_loading_animation(self) -> None:
         if self.loading_timer is not None:
             self.loading_timer.stop()
             self.loading_timer = None
+        self.loading_context = ""
+        self.loading_verb = ""
 
     def _advance_loading_animation(self) -> None:
         self.loading_step += 1
-        self.query_one("#setup-subtitle", Static).update(self._loading_text())
+        if self.loading_step % 4 == 0:
+            choices = [verb for verb in THINKING_VERBS if verb != self.loading_verb]
+            self.loading_verb = self.loading_random.choice(choices or THINKING_VERBS)
+        self._render_loading_animation()
 
-    def _loading_text(self) -> str:
-        frames = ["|", "/", "-", "\\"]
+    def _render_loading_animation(self) -> None:
+        if not self.loading_context:
+            return
+        if self.session is None:
+            self.query_one("#setup-subtitle", Static).update(self._loading_text())
+            return
+        world = self.session.world
+        self.query_one("#topbar", Static).update(self._topbar_text(world))
+        self.query_one("#director-panel", Static).update(self._thinking_text(include_context=True))
+        self.query_one("#footer-note", Static).update(self._thinking_text())
+
+    def _loading_text(self) -> Text:
+        text = self._thinking_text(include_context=True)
+        if self.loading_theme:
+            text.append("\n")
+            text.append(self.loading_theme, style="dim #9ca3af")
+        return text
+
+    def _thinking_text(self, include_context: bool = False) -> Text:
+        frames = ["|", "/", "-", "\\", "·", "*"]
         frame = frames[self.loading_step % len(frames)]
-        return f"Generating world {frame}\n{self.loading_theme or 'Preparing campaign'}"
+        model = self._model_label()
+        context = self.loading_context or "Dungeon Master"
+        verb = self.loading_verb or "thinking"
+        text = Text()
+        text.append(frame, style="bold #facc15")
+        text.append(" ")
+        text.append("DM ", style="bold #f9a8d4")
+        text.append(verb, style="bold #67e8f9")
+        if include_context:
+            text.append(f" - {context}", style="#c4b5fd")
+        text.append(f" [{model}]", style="dim #9ca3af")
+        return text
 
     def _handle_command(self, command: str) -> None:
         if self.session is None:
@@ -786,6 +858,7 @@ class WorldSimApp(App[None]):
             return
         self.command_in_progress = True
         self.stream_buffer = ""
+        self._start_loading_animation(command, context="Resolving turn")
         self.run_worker(lambda: self._handle_command_worker(command), thread=True, exclusive=True)
 
     def _handle_command_worker(self, command: str) -> None:
@@ -804,13 +877,17 @@ class WorldSimApp(App[None]):
 
     def _finish_command_without_result(self) -> None:
         self._clear_stream_callback()
+        self._stop_loading_animation()
         self.command_in_progress = False
+        self.query_one("#footer-note", Static).update(self._footer_text())
 
     def _finish_command(self, result) -> None:
         self._clear_stream_callback()
+        self._stop_loading_animation()
         self.command_in_progress = False
         if self.session is None:
             return
+        self._sync_usage_totals(self.session.world)
         self.session.last_message = result.message
         self._append_transcript(f"DM: {result.message}")
         self.store.save(self.session.world, self.session.player, self.session.memory)
@@ -818,7 +895,7 @@ class WorldSimApp(App[None]):
             self._track_player_in_view()
         self._refresh_ui()
         if self.session.player.hp <= 0:
-            self.session.last_message = "You fall, and the frontier closes over your story."
+            self.session.last_message = "You fall, and the story closes around you."
             self._append_transcript(f"System: {self.session.last_message}")
             self._refresh_ui()
         if result.should_quit:
@@ -838,17 +915,25 @@ class WorldSimApp(App[None]):
         self.stream_buffer = ""
         if self.session is not None:
             self.session.last_message = f"{label}..."
-            self._refresh_console_panel(f"{label}\n")
-            self.query_one("#director-panel", Static).update("LLM narration is streaming to the console.")
+            live = self._thinking_text(include_context=True)
+            live.append("\n")
+            live.append(label, style="dim #9ca3af")
+            self._refresh_console_panel(live)
+            self.query_one("#director-panel", Static).update(self._thinking_text(include_context=True))
 
     def _append_stream_delta(self, delta: str) -> None:
         self.stream_buffer += delta
         if self.session is not None:
             narration = _partial_json_string_field(self.stream_buffer, "narration")
             if narration:
-                self._refresh_console_panel(f"LLM narration stream:\n{narration[-2400:]}")
+                live = self._thinking_text(include_context=True)
+                live.append("\n")
+                live.append(narration[-2400:], style="#e5e7eb")
+                self._refresh_console_panel(live)
             else:
-                self._refresh_console_panel("LLM response received. Waiting for narration...")
+                live = self._thinking_text(include_context=True)
+                live.append("\nWaiting for narration...", style="dim #9ca3af")
+                self._refresh_console_panel(live)
 
     def on_resize(self, event: Resize) -> None:
         del event
@@ -857,6 +942,11 @@ class WorldSimApp(App[None]):
         if self.follow_player:
             self._track_player_in_view()
         self._refresh_ui()
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if self.session is None or event.pane.id != "tab-world":
+            return
+        self.call_after_refresh(self._sync_camera_after_layout)
 
     def _sync_camera_after_layout(self) -> None:
         if self.session is None:
@@ -888,9 +978,6 @@ class WorldSimApp(App[None]):
         self.query_one("#summary-panel", Static).update(self._summary_text(world))
         self.query_one("#player-panel", Static).update(self._player_text(player))
         self.query_one("#hooks-panel", Static).update(self._hooks_text(world))
-        self.query_one("#areas-panel", Static).update(self._areas_text(location))
-        self._refresh_area_buttons()
-        self._refresh_action_buttons()
         self._refresh_choice_buttons()
         self.query_one("#local-panel", Static).update(self._local_text(location, npc, memory))
         self.query_one("#director-panel", Static).update(self.session.last_message)
@@ -902,12 +989,12 @@ class WorldSimApp(App[None]):
         self.query_one("#progression-panel", Static).update(self._progression_text(player))
         self.query_one("#traits-panel", Static).update(self._skill_detail_text(player))
         self.query_one("#milestones-panel", Static).update(self._milestones_text(player))
-        self.query_one("#chronicle-panel", Static).update(self._chronicle_text(world))
-        self.query_one("#memory-panel", Static).update(self._memory_text(memory, world, player))
         self.query_one("#system-panel", Static).update(self._system_text(memory))
+        if not self.command_in_progress:
+            self.query_one("#footer-note", Static).update(self._footer_text())
         self._refresh_console_panel()
 
-    def _refresh_console_panel(self, live_stream: str | None = None) -> None:
+    def _refresh_console_panel(self, live_stream: str | Text | None = None) -> None:
         if self.session is None:
             return
         console_panel = self.query_one("#console-panel", RichLog)
@@ -985,8 +1072,8 @@ class WorldSimApp(App[None]):
             f"Terrain: {self.engine.biome_at(world, player.position).value}",
         ]
         if location is None:
-            lines.append("Location: Untamed frontier")
-            lines.append("No settlement claims this ground.")
+            lines.append("Location: Unmapped scene")
+            lines.append("No named location anchors this ground.")
         else:
             lines.extend(
                 [
@@ -1028,17 +1115,21 @@ class WorldSimApp(App[None]):
         )
 
     def _player_text(self, player: Player) -> str:
+        homeland_description = ""
+        if self.session is not None:
+            homeland_description = self.session.world.homeland_descriptions.get(player.homeland, "")
         return "\n".join(
-            [
+            [line for line in [
                 f"Name: {player.name}",
                 f"Class: {player.archetype.title()}",
                 f"Homeland: {player.homeland}",
+                homeland_description,
                 f"HP: {player.hp}/{player.max_hp}",
                 f"Gold: {player.gold}",
                 f"XP: {player.xp}",
                 "Inventory:",
                 ", ".join(player.inventory),
-            ]
+            ] if line]
         )
 
     def _refresh_inventory_buttons(self, player: Player) -> None:
@@ -1064,12 +1155,8 @@ class WorldSimApp(App[None]):
         if not player.inventory:
             return "No item selected."
         item = player.inventory[self.selected_inventory_index]
-        descriptions = {
-            "bedroll": "A simple camp bed. Useful when resting away from settlements.",
-            "torch": "A pitch torch. Helps with dark searches and exploration rolls.",
-            "rations": "Travel food. Keeps you moving when roads or weather turn bad.",
-        }
-        lines = [item.title(), "", descriptions.get(item, "A carried item. Try using, reading, giving, or examining it in the command line.")]
+        descriptions = self.session.world.inventory_descriptions if self.session is not None else {}
+        lines = [item.title(), "", descriptions.get(item, "A carried item with no special notes yet.")]
         return "\n".join(lines)
 
     def _resources_text(self, player: Player, world: World) -> str:
@@ -1121,7 +1208,7 @@ class WorldSimApp(App[None]):
             if index < len(skills):
                 name, value = skills[index]
                 prefix = "> " if index == self.selected_skill_index else ""
-                button.label = f"{prefix}{self._skill_label(name)} +{value}"
+                button.label = f"{prefix}{self._skill_label(name)} {self._format_bonus(value)}"
                 button.disabled = False
             else:
                 button.label = "No Skill"
@@ -1141,7 +1228,7 @@ class WorldSimApp(App[None]):
         return "\n".join(
             [
                 self._skill_label(name),
-                f"Bonus: +{value}",
+                f"Bonus: {self._format_bonus(value)}",
                 "",
                 self._skill_description(name),
             ]
@@ -1161,7 +1248,14 @@ class WorldSimApp(App[None]):
             "archery": "Used for ranged attacks and careful shots under pressure.",
             "command": "Used for leadership, battlefield orders, and forceful presence.",
         }
+        if self.session is not None:
+            generated = self.session.world.skill_descriptions.get(skill)
+            if generated:
+                return generated
         return descriptions.get(skill, "Used when the situation calls for this specialty.")
+
+    def _format_bonus(self, value: int) -> str:
+        return f"+{value}" if value > 0 else str(value)
 
     def _progression_text(self, player: Player) -> str:
         level = self._player_level(player)
@@ -1220,15 +1314,35 @@ class WorldSimApp(App[None]):
         return "\n".join(lines).strip()
 
     def _hooks_text(self, world: World) -> str:
+        active = next((quest for quest in world.quests if quest.id == world.active_quest_id), None)
         lines = [
             f"Theme: {world.theme_prompt}",
             "",
             f"Campaign Quest: {world.overarching_quest}",
             "",
-            f"Current Quest: {world.active_quest or 'None selected'}",
+            f"Current Objective: {world.active_quest or 'None selected'}",
             "",
-            "Active Threads:",
         ]
+        if active is not None:
+            stage = active.stages[min(active.current_stage, len(active.stages) - 1)] if active.stages else active.goal
+            lines.extend(
+                [
+                    f"Quest: {active.title}",
+                    f"Stage: {stage}",
+                    f"Progress: {active.progress}/{active.progress_required}",
+                    "",
+                ]
+            )
+            if active.discoveries:
+                lines.append("Discoveries:")
+                lines.extend(active.discoveries[-4:])
+                lines.append("")
+        active_clocks = [clock for clock in world.clocks if clock.status == "active"]
+        if active_clocks:
+            lines.append("Clocks:")
+            lines.extend(f"{clock.title}: {clock.value}/{clock.max_value}" for clock in active_clocks[:4])
+            lines.append("")
+        lines.append("Loose Threads:")
         lines.extend(world.quest_hooks[:5])
         return "\n\n".join(line for line in lines if line) or "No active hooks."
 
@@ -1242,7 +1356,7 @@ class WorldSimApp(App[None]):
         if location is not None:
             lines.append(f"Current Region: {location.name}")
         else:
-            lines.append("Current Region: Untamed frontier")
+            lines.append("Current Region: Unmapped scene")
         lines.append(f"Selected Area: {self._display_area(self.session.selected_area)}")
         lines.append(f"Entered Area: {self._display_area(self.session.entered_area)}")
         lines.append("")
@@ -1320,7 +1434,6 @@ class WorldSimApp(App[None]):
         state_target = Path(self.store.state_path).resolve()
         director_status = getattr(self.director, "status_line", f"Director: {type(self.director).__name__}")
         debug_path = str(self.debug_logger.path.resolve()) if self.debug_logger is not None else "disabled"
-        usage_lines = self._usage_text()
         return "\n".join(
             [
                 "Canonical engine state is stored locally.",
@@ -1329,9 +1442,6 @@ class WorldSimApp(App[None]):
                 f"Debug log: {debug_path}",
                 f"Tracked memory entries: {len(memory.entries)}",
                 director_status,
-                "",
-                "API usage:",
-                *usage_lines,
                 "",
                 "LLM boundary:",
                 "- engine owns rolls, HP, movement, state mutation",
@@ -1353,17 +1463,44 @@ class WorldSimApp(App[None]):
             ]
         )
 
-    def _topbar_text(self, world: World) -> str:
+    def _topbar_text(self, world: World) -> Text:
+        model = self._model_label()
+        usage_text = self._usage_summary(world)
+        text = Text()
+        text.append(f"Model: {model}", style="bold #a7f3d0")
+        text.append(f"  |  {usage_text}", style="#bae6fd")
+        if self.command_in_progress and self.loading_context:
+            text.append("  |  ", style="dim #64748b")
+            text.append_text(self._thinking_text(include_context=True))
+        text.append("\n")
+        text.append(world.campaign_title, style="bold #f9fafb")
+        text.append(f"  |  Tick {world.tick:,}  |  Stability {world.stability}%", style="#cbd5e1")
+        return text
+
+    def _usage_summary(self, world: World) -> str:
         usage = self._usage_tracker()
         if usage is None or usage.request_count == 0:
-            usage_text = "LLM usage pending"
+            session_text = "session pending"
         else:
             cost_text = f"${usage.estimated_cost:.4f}" if usage.estimated_cost else "cost unknown"
-            usage_text = f"{format_tokens(usage.total_tokens)} tokens  |  est. {cost_text}"
-        return (
-            f"{world.campaign_title}  |  Tick {world.tick:,}  |  Stability {world.stability}%\n"
-            f"{usage_text}"
-        )
+            session_text = f"session {format_tokens(usage.total_tokens)} tokens / {cost_text}"
+        if world.usage_totals.request_count == 0:
+            save_text = "save pending"
+        else:
+            save_cost = f"${world.usage_totals.estimated_cost:.4f}" if world.usage_totals.estimated_cost else "cost unknown"
+            save_text = f"save {format_tokens(world.usage_totals.total_tokens)} tokens / {save_cost}"
+        return f"{session_text}  |  {save_text}"
+
+    def _footer_text(self) -> str:
+        return "m/Esc map | arrows move | talk dialogue | / command line | shift+arrows pan | f follow"
+
+    def _model_label(self) -> str:
+        client = getattr(self.director, "client", None)
+        config = getattr(client, "config", None)
+        model = getattr(config, "model", None)
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        return type(self.director).__name__
 
     def _usage_text(self) -> list[str]:
         usage = self._usage_tracker()
@@ -1387,6 +1524,19 @@ class WorldSimApp(App[None]):
         client = getattr(self.director, "client", None)
         tracker = getattr(client, "usage_tracker", None)
         return tracker if isinstance(tracker, TokenUsageTracker) else None
+
+    def _sync_usage_totals(self, world: World) -> None:
+        usage = self._usage_tracker()
+        if usage is None:
+            return
+        current = usage.snapshot()
+        world.usage_totals.request_count += max(0, current.request_count - self.synced_usage.request_count)
+        world.usage_totals.prompt_tokens += max(0, current.prompt_tokens - self.synced_usage.prompt_tokens)
+        world.usage_totals.completion_tokens += max(0, current.completion_tokens - self.synced_usage.completion_tokens)
+        world.usage_totals.total_tokens += max(0, current.total_tokens - self.synced_usage.total_tokens)
+        world.usage_totals.cached_prompt_tokens += max(0, current.cached_prompt_tokens - self.synced_usage.cached_prompt_tokens)
+        world.usage_totals.estimated_cost += max(0.0, current.estimated_cost - self.synced_usage.estimated_cost)
+        self.synced_usage = current
 
     def _player_level(self, player: Player) -> int:
         thresholds = [0, 5, 15, 30, 50, 75, 105]

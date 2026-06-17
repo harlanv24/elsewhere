@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from worldsim.models import DirectorBeat, Location, Npc, Player, World
+from worldsim.models import DirectorBeat, Location, Npc, Player, Quest, QuestClock, World
 
 
 TEXT_RESPONSE_SCHEMA: dict[str, object] = {
@@ -27,6 +27,8 @@ WORLD_DETAILS_SCHEMA: dict[str, object] = {
         "quest_hooks",
         "player_archetypes",
         "homelands",
+        "starting_inventory",
+        "skill_descriptions",
     ],
     "properties": {
         "campaign_title": {"type": "string"},
@@ -45,14 +47,14 @@ WORLD_DETAILS_SCHEMA: dict[str, object] = {
                     "description": {"type": "string"},
                     "skill_bonuses": {
                         "type": "array",
-                        "minItems": 5,
-                        "maxItems": 7,
+                        "minItems": 4,
+                        "maxItems": 8,
                         "items": {
                             "type": "object",
                             "required": ["skill", "bonus"],
                             "properties": {
                                 "skill": {"type": "string"},
-                                "bonus": {"type": "integer", "minimum": 1, "maximum": 3},
+                                "bonus": {"type": "integer", "minimum": -2, "maximum": 4},
                             },
                             "additionalProperties": False,
                         },
@@ -60,16 +62,57 @@ WORLD_DETAILS_SCHEMA: dict[str, object] = {
                     "boosts": {
                         "type": "object",
                         "properties": {
-                            "exploration_check": {"type": "integer", "minimum": 0, "maximum": 3},
-                            "social_check": {"type": "integer", "minimum": 0, "maximum": 3},
-                            "combat_check": {"type": "integer", "minimum": 0, "maximum": 3},
+                            "exploration_check": {"type": "integer", "minimum": -2, "maximum": 4},
+                            "social_check": {"type": "integer", "minimum": -2, "maximum": 4},
+                            "combat_check": {"type": "integer", "minimum": -2, "maximum": 4},
                         },
                     },
                 },
                 "additionalProperties": False,
             },
         },
-        "homelands": {"type": "array", "items": {"type": "string"}, "minItems": 5, "maxItems": 8},
+        "homelands": {
+            "type": "array",
+            "minItems": 5,
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "required": ["name", "description"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "starting_inventory": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 5,
+            "items": {
+                "type": "object",
+                "required": ["name", "description"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "skill_descriptions": {
+            "type": "array",
+            "minItems": 8,
+            "maxItems": 30,
+            "items": {
+                "type": "object",
+                "required": ["skill", "description"],
+                "properties": {
+                    "skill": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
         "locations": {
             "type": "array",
             "items": {
@@ -120,6 +163,23 @@ DIRECTOR_BEAT_SCHEMA: dict[str, object] = {
         "inventory_add": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
         "inventory_remove": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
         "choices": {"type": "array", "items": {"type": "string"}, "minItems": 0, "maxItems": 4},
+        "progress_summary": {"type": ["string", "null"]},
+        "quest_progress_delta": {"type": "integer", "minimum": 0, "maximum": 2},
+        "complete_current_stage": {"type": "boolean"},
+        "clock_effects": {
+            "type": "array",
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "required": ["clock_id", "delta", "reason"],
+                "properties": {
+                    "clock_id": {"type": "string"},
+                    "delta": {"type": "integer", "minimum": -2, "maximum": 2},
+                    "reason": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
     },
     "additionalProperties": False,
 }
@@ -178,6 +238,9 @@ def director_context(
                 for event in world.recent_events[:5]
             ],
             "active_quest": world.active_quest,
+            "active_quest_id": world.active_quest_id,
+            "quests": [_quest_payload(quest) for quest in world.quests],
+            "clocks": [_clock_payload(clock) for clock in world.clocks],
             "current_activity": world.current_activity,
             "movement_lock": world.movement_lock,
             "current_choices": world.current_choices,
@@ -227,6 +290,10 @@ def world_details_from_payload(payload: dict[str, object]) -> dict[str, object]:
         "player_archetype_blurbs": {},
         "player_archetype_boosts": {},
         "homelands": [],
+        "homeland_descriptions": {},
+        "starting_inventory": [],
+        "inventory_descriptions": {},
+        "skill_descriptions": {},
     }
     for raw_location in payload.get("locations", []):
         if not isinstance(raw_location, dict) or not isinstance(raw_location.get("index"), int):
@@ -235,7 +302,7 @@ def world_details_from_payload(payload: dict[str, object]) -> dict[str, object]:
         summary = raw_location.get("summary")
         if isinstance(name, str) and name.strip() and isinstance(summary, str) and summary.strip():
             details["locations"].append(
-                {"index": raw_location["index"], "name": name.strip()[:40], "summary": summary.strip()[:160]}
+                {"index": raw_location["index"], "name": name.strip()[:40], "summary": summary.strip()[:110]}
             )
     for raw_npc in payload.get("npcs", []):
         if not isinstance(raw_npc, dict) or not isinstance(raw_npc.get("index"), int):
@@ -255,7 +322,7 @@ def world_details_from_payload(payload: dict[str, object]) -> dict[str, object]:
                 }
             )
     hooks = [hook.strip() for hook in payload.get("quest_hooks", []) if isinstance(hook, str) and hook.strip()]
-    details["quest_hooks"] = hooks[:6]
+    details["quest_hooks"] = [hook[:130] for hook in hooks[:6]]
     archetypes: list[str] = []
     blurbs: dict[str, str] = {}
     boosts_by_archetype: dict[str, dict[str, int]] = {}
@@ -281,11 +348,55 @@ def world_details_from_payload(payload: dict[str, object]) -> dict[str, object]:
             blurbs[name] = description[:180]
         if boosts:
             boosts_by_archetype[name] = boosts
-    homelands = [item.strip() for item in payload.get("homelands", []) if isinstance(item, str) and item.strip()]
+    homelands: list[str] = []
+    homeland_descriptions: dict[str, str] = {}
+    for raw_homeland in payload.get("homelands", []):
+        if isinstance(raw_homeland, str):
+            name = raw_homeland.strip()
+            description = ""
+        elif isinstance(raw_homeland, dict):
+            raw_name = raw_homeland.get("name")
+            raw_description = raw_homeland.get("description")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            description = raw_description.strip() if isinstance(raw_description, str) else ""
+        else:
+            continue
+        if not name:
+            continue
+        homelands.append(name[:50])
+        if description:
+            homeland_descriptions[name[:50]] = description[:150]
     details["player_archetypes"] = archetypes[:6]
     details["player_archetype_blurbs"] = {key: blurbs[key] for key in archetypes[:6] if key in blurbs}
     details["player_archetype_boosts"] = {key: boosts_by_archetype[key] for key in archetypes[:6] if key in boosts_by_archetype}
     details["homelands"] = homelands[:8]
+    details["homeland_descriptions"] = {key: homeland_descriptions[key] for key in homelands[:8] if key in homeland_descriptions}
+    inventory: list[str] = []
+    inventory_descriptions: dict[str, str] = {}
+    for raw_item in payload.get("starting_inventory", []):
+        if not isinstance(raw_item, dict):
+            continue
+        name = raw_item.get("name")
+        description = raw_item.get("description")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        item = name.strip().lower()[:60]
+        inventory.append(item)
+        if isinstance(description, str) and description.strip():
+            inventory_descriptions[item] = description.strip()[:140]
+    details["starting_inventory"] = inventory[:5]
+    details["inventory_descriptions"] = inventory_descriptions
+    skill_descriptions: dict[str, str] = {}
+    for raw_skill in payload.get("skill_descriptions", []):
+        if not isinstance(raw_skill, dict):
+            continue
+        skill = raw_skill.get("skill")
+        description = raw_skill.get("description")
+        if not isinstance(skill, str) or not skill.strip() or not isinstance(description, str) or not description.strip():
+            continue
+        key = skill.strip().lower().replace(" ", "_").replace("-", "_")
+        skill_descriptions[key] = description.strip()[:140]
+    details["skill_descriptions"] = skill_descriptions
     return details
 
 
@@ -311,6 +422,10 @@ def director_beat_from_payload(payload: dict[str, object]) -> DirectorBeat:
         inventory_add=_string_list(payload.get("inventory_add"), 4),
         inventory_remove=_string_list(payload.get("inventory_remove"), 4),
         choices=_string_list(payload.get("choices"), 4),
+        progress_summary=_optional_string(payload, "progress_summary"),
+        quest_progress_delta=_bounded_int(payload.get("quest_progress_delta"), 0, 2, default=0),
+        complete_current_stage=bool(payload.get("complete_current_stage", False)),
+        clock_effects=_clock_effects(payload.get("clock_effects")),
     )
 
 
@@ -362,6 +477,34 @@ def _npc_payload(npc: Npc) -> dict[str, object]:
     }
 
 
+def _quest_payload(quest: Quest) -> dict[str, object]:
+    stage = quest.stages[min(quest.current_stage, len(quest.stages) - 1)] if quest.stages else quest.goal
+    return {
+        "id": quest.id,
+        "title": quest.title,
+        "goal": quest.goal,
+        "status": quest.status,
+        "current_stage_index": quest.current_stage,
+        "current_stage": stage,
+        "progress": quest.progress,
+        "progress_required": quest.progress_required,
+        "discoveries": _compact_lines(quest.discoveries[-5:], 180),
+        "related_locations": list(quest.related_locations),
+        "related_npcs": list(quest.related_npcs),
+    }
+
+
+def _clock_payload(clock: QuestClock) -> dict[str, object]:
+    return {
+        "id": clock.id,
+        "title": clock.title,
+        "value": clock.value,
+        "max_value": clock.max_value,
+        "description": clock.description,
+        "status": clock.status,
+    }
+
+
 def _scene_objects_at(world: World, player: Player) -> list[str]:
     return list(world.scene_objects.get(f"{player.position.x},{player.position.y}", []))
 
@@ -398,7 +541,7 @@ def _check_boosts(value: object) -> dict[str, int]:
     for key in ("exploration_check", "social_check", "combat_check"):
         raw = value.get(key)
         if isinstance(raw, int):
-            boosts[key] = max(0, min(3, raw))
+            boosts[key] = max(-2, min(4, raw))
     return boosts
 
 
@@ -414,8 +557,36 @@ def _skill_bonuses(value: object) -> dict[str, int]:
         if not isinstance(skill, str) or not skill.strip() or not isinstance(bonus, int):
             continue
         key = skill.strip().lower().replace(" ", "_").replace("-", "_")
-        boosts[key] = max(1, min(3, bonus))
+        boosts[key] = max(-2, min(4, bonus))
     return boosts
+
+
+def _bounded_int(value: object, minimum: int, maximum: int, default: int) -> int:
+    if not isinstance(value, int):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _clock_effects(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    effects: list[dict[str, object]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        clock_id = raw.get("clock_id")
+        delta = raw.get("delta")
+        reason = raw.get("reason")
+        if not isinstance(clock_id, str) or not clock_id.strip() or not isinstance(delta, int):
+            continue
+        effects.append(
+            {
+                "clock_id": clock_id.strip()[:60],
+                "delta": max(-2, min(2, delta)),
+                "reason": reason.strip()[:160] if isinstance(reason, str) and reason.strip() else "Scene pressure changed.",
+            }
+        )
+    return effects[:3]
 
 
 def _compact_lines(lines: list[str], max_length: int) -> list[str]:

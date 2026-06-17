@@ -42,6 +42,10 @@ Return structured beats with:
 - tags
 - follow_up_hook
 - choices
+- progress_summary
+- quest_progress_delta
+- complete_current_stage
+- clock_effects
 """.strip()
 
 
@@ -484,54 +488,22 @@ def director_from_env(seed: int, debug_logger: DebugLogger | None = None) -> Dir
 def _llm_system_prompt() -> str:
     return (
         f"{LLM_ENGINE_CONTRACT}\n\n"
-        "Read the JSON task and context from the user message. "
-        "Return only one JSON object that matches response_schema. "
-        "For generate_world_details, rewrite the provided indexed locations and NPCs while preserving their indexes. "
-        "Use context.theme_prompt as the creative brief for the whole campaign. "
-        "Create a campaign_title and overarching_quest that fit the theme_prompt and can sustain many sessions. "
-        "Create player_archetypes and homelands as concise playable character choices rooted in the generated world and theme_prompt. "
-        "Create five or six player_archetypes. "
-        "Each player_archetype needs a lower-case name, a one-sentence description, and five to seven skill_bonuses. "
-        "Skill names should be user-facing rollable skills such as tracking, stealth, courtly etiquette, spirit lore, archery, endurance, investigation, medicine, command, dueling, sailing, or ritual. "
-        "Descriptions should say what the class specializes in using those rollable skills. "
-        "Keep skill bonuses modest, 1 to 3, and make each class mechanically distinct. "
-        "Player archetype names should be lower-case class names suitable for mechanics, such as shrine warden, court spy, or storm sailor. "
-        "Create five to eight homelands. Homelands should be places, clans, settlements, orders, or regions that exist naturally in this campaign. "
-        "Treat provided biomes and coordinates as a neutral terrain scaffold; interpret each location through the theme_prompt rather than copying generic fantasy assumptions. "
-        "Location names must be evocative place names that fit the theme_prompt, not the placeholders from context. "
-        "Location summaries should make the world feel authored around the theme_prompt using culture, conflict, terrain, factions, landmarks, and mood. "
-        "Quest hooks must be concrete smaller quests that point toward, complicate, or reveal the overarching_quest. "
-        "Keep generate_world_details compact: summaries and hooks should each be one sentence. "
-        "For respond_to_dialogue, write only the NPC's in-character reply and make it respond directly to player_dialogue. "
-        "Do not reflexively end messages with a question. NPCs may ask follow-up questions when they create a meaningful choice, reveal character, or add new information. "
-        "Prolonged dialogue is appropriate when it has tension, discovery, negotiation, or relationship stakes; avoid stalling with repeated prompts when the scene should move to action. "
-        "Regularly move scenes toward concrete choices, visible risks, and actionable next steps. "
-        "Most action, exploration, and dialogue beats should include two to four short choices in the choices array. "
-        "Choices should be player actions, not questions, and should be specific enough to click directly. "
-        "The player may still type any open-ended action. "
-        "When a risky action should be uncertain, request a mechanical check using mechanical_request and difficulty; never decide the roll result yourself. "
-        "Use exploration_check for searching, tracking, traversal, lore clues, and environmental hazards. "
-        "Use social_check for persuasion, deception, intimidation, insight, and negotiation. "
-        "Use combat_check for violence, chases under threat, and direct physical danger. "
-        "Use state_ledger.npc_conversation_history as authoritative conversation state; do not repeat a prior NPC answer unless the player asks for repetition. "
-        "Never return text that closely matches state_ledger.npc_prior_replies. "
-        "If the player changes topic, answer the new topic directly. "
-        "For respond_to_action with action talk, vary the NPC's opener using active_dialogue_history and include a question or clear conversational hook. "
-        "For respond_to_freeform_action, interpret action as the player's exact attempted action. "
-        "Treat state_ledger as authoritative world state. Do not reintroduce objects marked destroyed, removed, or in_inventory. "
-        "Do not offer inventory_add for an item already present in state_ledger.player_inventory. "
-        "Use visible_scene_objects to decide whether taking, reading, opening, searching, using, or moving an object makes sense. "
-        "Do not restate the setup from memory_context. Start at the moment the action happens and describe the consequence. "
-        "If action repeats a recent action in memory_context, make the world react to the repetition instead of reusing the old wording. "
-        "If action targets a visible object, directly resolve what happens to that object. "
-        "If action is destructive, describe whether the target is damaged, changed, protected, or destroyed. "
-        "If the action reveals objects, list them in scene_objects. "
-        "If the player successfully takes a small portable object, list it in inventory_add. "
-        "If the player uses or consumes an inventory item, list it in inventory_remove. "
-        "Do not wrap the JSON in Markdown. "
-        "Do not add commentary before or after the JSON. "
-        "Use null for absent optional fields. "
-        "Keep narration to one or two vivid paragraphs."
+        "Read the JSON task and context from the user message. Return exactly one JSON object matching response_schema. "
+        "Use null for absent optional fields and do not wrap JSON in Markdown. "
+        "For generate_world_details, preserve provided indexes. Use context.theme_prompt to create a compact campaign_title, overarching_quest, weather, opening_event, named locations, NPCs, quest hooks, five or six lower-case player_archetypes with distinctive rollable skill bonuses, five to eight homelands, starting_inventory, and skill_descriptions. Keep worldbuilding terse and playable. "
+        "Player archetypes should not be evenly distributed. Give each one a strong identity: four to eight skills, at least one drawback on most archetypes, rare niche skills, occasional signature +4 bonuses, normal strengths around +1 to +3, and penalties from -1 to -2 where appropriate. "
+        "Starting inventory should be three to five mundane, useful, theme-specific items with short descriptions. Skill descriptions should explain how each generated skill works in this specific theme, not generic adventure wording. "
+        "Infer genre, tone, stakes, social rules, dialogue style, locations, items, class names, and conflicts from theme_prompt. Theme_prompt overrides every default fantasy or frontier assumption. "
+        "Treat biomes and coordinates as an abstract scene scaffold; reinterpret them through the theme instead of mentioning terrain when it does not fit. Keep summaries and hooks to one short sentence. "
+        "For narration tasks, write two to five concise sentences grounded in current state and matching the theme's tone. Favor playable information, voice, and choices over lore exposition. Do not decide dice outcomes or mutate engine-owned resources. "
+        "Treat context.world.quests and context.world.clocks as the campaign spine. Drive the active quest's current_stage forward instead of replacing it with a tangent. "
+        "Use progress_summary for concrete evidence, commitments, discoveries, or consequences worth recording. quest_progress_delta is 0 for color, 1 for meaningful progress, and 2 for major progress. Set complete_current_stage only when the scene satisfies the current stage. "
+        "Use clock_effects only for existing clock IDs. Positive deltas worsen pressure; negative deltas reduce pressure. follow_up_hook is only a loose thread or rumor. "
+        "Offer two to four short choices for most action, exploration, and dialogue beats. Choices should be concrete player actions. "
+        "Request mechanical_request and difficulty for uncertainty: exploration_check for search, traversal, lore, hazards; social_check for persuasion, deception, intimidation, insight, negotiation; combat_check for violence, chases under threat, and direct physical danger. "
+        "For dialogue, reply in character to player_dialogue, match the theme's style and social rules, use conversation history as authoritative state, avoid repeated prior NPC replies, and move stalled conversations toward a decision or action. "
+        "For freeform actions, resolve the exact attempted action against state_ledger and visible_scene_objects. Do not reintroduce removed, destroyed, or in_inventory objects. "
+        "If an action reveals objects, list them in scene_objects. If the player takes a small visible portable object, list it in inventory_add. If the player uses or consumes an inventory item, list it in inventory_remove."
     )
 
 
@@ -561,9 +533,20 @@ def _world_generation_context(world: World) -> dict[str, object]:
                 for index, _ in enumerate(world.npcs)
             ],
         },
-        "style": {
-            "genre": "grounded fantasy frontier",
-            "tone": "mysterious, playable, concise",
-            "avoid": ["generic medieval filler", "modern slang", "placeholder names"],
-        },
+        "style": _style_context(world.theme_prompt),
+    }
+
+
+def _style_context(theme_prompt: str) -> dict[str, object]:
+    avoid = ["placeholder names", "generic filler", "ignoring the requested theme"]
+    guidance = [
+        "Infer genre, tone, stakes, dialogue style, social rules, pacing, and naming from theme_prompt.",
+        "The terrain scaffold is abstract; reinterpret it as neighborhoods, rooms, routes, sectors, offices, venues, or other theme-appropriate spaces.",
+        "Do not copy default fantasy language unless theme_prompt asks for it.",
+    ]
+    return {
+        "genre": theme_prompt,
+        "tone": "infer from theme_prompt; keep it playable and concise",
+        "guidance": guidance,
+        "avoid": avoid,
     }

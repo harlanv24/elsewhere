@@ -6,7 +6,7 @@ import secrets
 
 from worldsim.director import Director
 from worldsim.memory import CampaignMemory
-from worldsim.models import Biome, CommandResult, DirectorBeat, Event, Location, Npc, Player, Position, World
+from worldsim.models import Biome, CommandResult, DirectorBeat, Event, Location, Npc, Player, Position, Quest, QuestClock, World
 
 
 class WorldEngine:
@@ -17,7 +17,7 @@ class WorldEngine:
     def create_world(self, director: Director | None = None, theme_prompt: str | None = None) -> World:
         width = 96
         height = 52
-        theme = (theme_prompt or "grounded fantasy frontier").strip()[:500]
+        theme = (theme_prompt or "character-driven adventure").strip()[:500]
         tiles = self._generate_tiles(width, height)
         locations = self._generate_locations(tiles, width, height)
         npcs = self._generate_npcs(locations)
@@ -33,11 +33,11 @@ class WorldEngine:
             stability=68,
             theme_prompt=theme,
         )
-        self._add_event(world, "world", "The frontier wakes under a restless sky.")
+        self._add_event(world, "world", "The campaign begins around a problem waiting to be noticed.")
         world.quest_hooks = self._starting_hooks(locations)
         if director is not None:
             self._apply_world_details(world, director.generate_world_details(world))
-        world.active_quest = world.quest_hooks[0] if world.quest_hooks else world.overarching_quest
+        self._ensure_progression(world)
         self._refresh_alerts(world, None)
         return world
 
@@ -54,6 +54,7 @@ class WorldEngine:
             gold=12,
             xp=0,
             position=start.position,
+            inventory=list(world.starting_inventory[:8]),
             boosts=boosts,
         )
 
@@ -71,6 +72,7 @@ class WorldEngine:
         text = raw_command.lower()
         if not text:
             return CommandResult("Type a command. Try `help` if you want the list.")
+        self._ensure_progression(world)
 
         if text in {"quit", "exit"}:
             return CommandResult("The world will wait.", should_quit=True)
@@ -108,6 +110,8 @@ class WorldEngine:
             if location is not None:
                 memory.remember_location(location, world.tick)
             memory.remember_world_state(world, player)
+            if location is None:
+                return CommandResult(result.message, advance_time=True)
             description = director.describe_location(
                 world,
                 player,
@@ -164,6 +168,7 @@ class WorldEngine:
                     tags=[place, "danger"],
                 )
                 message = f"{beat.narration}\n\n{world.last_roll} The search goes badly and you take {damage} damage."
+            self._apply_progression(world, player, beat, memory, location, success)
             self._advance_world(world, player, director, memory, "explore")
             memory.remember_world_state(world, player)
             return CommandResult(message, advance_time=True)
@@ -190,6 +195,7 @@ class WorldEngine:
                 )
                 message = beat.narration
                 self._remember_dialogue(world, npc, f"{npc.name}: {beat.narration}")
+            self._apply_progression(world, player, beat, memory, location, None)
             self._advance_world(world, player, director, memory, "talk")
             memory.remember_world_state(world, player)
             return CommandResult(message, advance_time=True)
@@ -223,6 +229,7 @@ class WorldEngine:
                 importance=7,
                 tags=[npc.name, npc.location_name, "dialogue"],
             )
+            self._apply_progression(world, player, DirectorBeat(title="Dialogue", narration=reply), memory, location, None)
             self._advance_world(world, player, director, memory, "talk")
             memory.remember_world_state(world, player)
             return CommandResult(reply, advance_time=True)
@@ -233,6 +240,7 @@ class WorldEngine:
             self._remember_scene_objects(world, player.position, beat.scene_objects)
             heal = self.random.randint(2, 5)
             player.hp = min(player.max_hp, player.hp + heal)
+            self._apply_progression(world, player, beat, memory, location, None)
             self._advance_world(world, player, director, memory, "rest")
             memory.remember(
                 "rest",
@@ -294,6 +302,7 @@ class WorldEngine:
                 world.current_activity = "combat"
                 world.movement_lock = "you are in a fight"
                 message = f"{beat.narration}\n\n{world.last_roll} The fight turns against you. You take {damage} damage."
+            self._apply_progression(world, player, beat, memory, location, success)
             self._advance_world(world, player, director, memory, "attack")
             memory.remember_world_state(world, player)
             return CommandResult(message, advance_time=True)
@@ -385,8 +394,6 @@ class WorldEngine:
 
     def _apply_beat_context(self, world: World, beat: DirectorBeat) -> None:
         world.current_choices = list(beat.choices[:4]) or self._default_choices(beat)
-        if beat.follow_up_hook:
-            world.active_quest = beat.follow_up_hook
         if beat.mechanical_request == "combat_check" or "combat" in beat.tags:
             world.current_activity = "combat"
             world.movement_lock = "you are in a fight"
@@ -405,6 +412,149 @@ class WorldEngine:
             return ["search carefully", "follow the clue", "return to the path"]
         return ["look around", "move on", "wait"]
 
+    def _ensure_progression(self, world: World) -> None:
+        if not world.quests:
+            hooks = world.quest_hooks or [world.overarching_quest]
+            world.quests = [self._quest_from_hook(hook, index, world) for index, hook in enumerate(hooks[:6])]
+        if world.quests and not world.active_quest_id:
+            active = next((quest for quest in world.quests if quest.status == "active"), world.quests[0])
+            world.active_quest_id = active.id
+        if not world.clocks:
+            world.clocks = [
+                QuestClock(
+                    id="central_threat",
+                    title="Central Threat",
+                    value=1,
+                    max_value=6,
+                    description=world.overarching_quest,
+                )
+            ]
+        self._sync_active_quest_display(world)
+
+    def _quest_from_hook(self, hook: str, index: int, world: World) -> Quest:
+        title = self._quest_title(hook, index)
+        return Quest(
+            id=self._slug(f"{index + 1}-{title}"),
+            title=title,
+            goal=hook,
+            stages=[
+                "Find a concrete lead.",
+                "Act on the lead and expose what is really happening.",
+                "Resolve the local threat and connect it back to the campaign quest.",
+            ],
+            related_locations=[location.name for location in world.locations[:2]],
+            related_npcs=[npc.name for npc in world.npcs[:2]],
+        )
+
+    def _quest_title(self, hook: str, index: int) -> str:
+        cleaned = " ".join(hook.strip().rstrip(".").split())
+        if not cleaned:
+            return f"Thread {index + 1}"
+        words = cleaned.split()
+        return " ".join(words[:5]).title()[:60]
+
+    def _slug(self, text: str) -> str:
+        chars: list[str] = []
+        previous_dash = False
+        for char in text.lower():
+            if char.isalnum():
+                chars.append(char)
+                previous_dash = False
+            elif not previous_dash:
+                chars.append("-")
+                previous_dash = True
+        return "".join(chars).strip("-")[:60] or "quest"
+
+    def _active_quest(self, world: World) -> Quest | None:
+        self._ensure_progression(world)
+        return next((quest for quest in world.quests if quest.id == world.active_quest_id), None)
+
+    def _sync_active_quest_display(self, world: World) -> None:
+        quest = next((item for item in world.quests if item.id == world.active_quest_id), None)
+        if quest is None:
+            world.active_quest = world.overarching_quest
+            return
+        if quest.status != "active":
+            replacement = next((item for item in world.quests if item.status == "active"), None)
+            if replacement is not None:
+                world.active_quest_id = replacement.id
+                quest = replacement
+        stage = quest.stages[min(quest.current_stage, len(quest.stages) - 1)] if quest.stages else quest.goal
+        world.active_quest = f"{quest.title}: {stage}"
+
+    def _apply_progression(
+        self,
+        world: World,
+        player: Player,
+        beat: DirectorBeat,
+        memory: CampaignMemory,
+        location: Location | None,
+        success: bool | None,
+    ) -> None:
+        self._ensure_progression(world)
+        progress_allowed = success is not False
+        quest = self._active_quest(world)
+        if quest is not None and progress_allowed:
+            delta = beat.quest_progress_delta
+            if beat.progress_summary and delta == 0:
+                delta = 1
+            if delta or beat.complete_current_stage:
+                summary = beat.progress_summary or f"{player.name} made progress on {quest.title}."
+                quest.discoveries.append(summary[:180])
+                del quest.discoveries[:-8]
+                quest.progress = min(quest.progress_required, quest.progress + delta)
+                self._remember_state_fact(world, f"Quest progress on {quest.title}: {summary}", world.tick)
+                memory.remember(
+                    "quest",
+                    quest.id,
+                    f"{quest.title}: {summary}",
+                    world.tick,
+                    importance=9,
+                    tags=["quest", quest.title, location.name if location else "frontier"],
+                )
+            if beat.complete_current_stage or quest.progress >= quest.progress_required:
+                self._advance_quest_stage(world, quest, memory)
+
+        for effect in beat.clock_effects:
+            delta = effect.get("delta", 0)
+            if success is False and isinstance(delta, int) and delta < 0:
+                continue
+            self._apply_clock_effect(world, effect)
+        self._sync_active_quest_display(world)
+
+    def _advance_quest_stage(self, world: World, quest: Quest, memory: CampaignMemory) -> None:
+        quest.progress = 0
+        if quest.current_stage + 1 >= len(quest.stages):
+            quest.status = "complete"
+            self._add_event(world, "quest", f"Quest completed: {quest.title}.")
+            memory.remember("quest", quest.id, f"{quest.title} is complete.", world.tick, importance=10, tags=["quest"])
+            replacement = next((item for item in world.quests if item.status == "active" and item.id != quest.id), None)
+            world.active_quest_id = replacement.id if replacement is not None else quest.id
+            return
+        quest.current_stage += 1
+        stage = quest.stages[quest.current_stage]
+        self._add_event(world, "quest", f"{quest.title} advanced: {stage}")
+        memory.remember("quest", quest.id, f"{quest.title} advanced to: {stage}", world.tick, importance=9, tags=["quest"])
+
+    def _apply_clock_effect(self, world: World, effect: dict[str, object]) -> None:
+        clock_id = effect.get("clock_id")
+        delta = effect.get("delta")
+        if not isinstance(clock_id, str) or not isinstance(delta, int) or delta == 0:
+            return
+        clock = next((item for item in world.clocks if item.id == clock_id and item.status == "active"), None)
+        if clock is None:
+            return
+        before = clock.value
+        clock.value = max(0, min(clock.max_value, clock.value + delta))
+        if clock.value == before:
+            return
+        reason = effect.get("reason")
+        reason_text = reason if isinstance(reason, str) and reason.strip() else "pressure changed"
+        self._remember_state_fact(world, f"Clock {clock.title} changed from {before} to {clock.value}: {reason_text}", world.tick)
+        if clock.value >= clock.max_value:
+            clock.status = "complete"
+            self._add_event(world, "clock", f"{clock.title} reaches its breaking point: {reason_text}", severity="warning")
+
     def summary_counts(self, world: World) -> dict[str, int]:
         return {
             "locations": len(world.locations),
@@ -415,6 +565,9 @@ class WorldEngine:
 
     def scene_objects_at(self, world: World, position: Position) -> list[str]:
         return list(world.scene_objects.get(self._position_key(position), []))
+
+    def ensure_progression(self, world: World) -> None:
+        self._ensure_progression(world)
 
     def _resolve_freeform_action(
         self,
@@ -458,19 +611,21 @@ class WorldEngine:
             importance=6,
             tags=[player.name, place, "action"],
         )
-        self._advance_world(world, player, director, memory, "freeform")
-        memory.remember_world_state(world, player)
         suffix_parts = []
         if added:
             suffix_parts.append(f"Added to inventory: {', '.join(added)}.")
         if removed_scene_items:
             suffix_parts.append(f"Scene changed: {', '.join(removed_scene_items)}.")
+        success: bool | None = None
         if beat.mechanical_request is not None:
             success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
             suffix_parts.insert(0, world.last_roll or "")
             if not success and beat.mechanical_request == "combat_check":
                 world.current_activity = "combat"
                 world.movement_lock = "you are in a fight"
+        self._apply_progression(world, player, beat, memory, location, success)
+        self._advance_world(world, player, director, memory, "freeform")
+        memory.remember_world_state(world, player)
         suffix = f"\n\n{' '.join(suffix_parts)}" if suffix_parts else ""
         return CommandResult(f"{beat.narration}{suffix}", advance_time=True)
 
@@ -704,7 +859,7 @@ class WorldEngine:
             world.weather = self.random.choice(
                 ["Cold drizzle", "Harsh sunlight", "Crosswind", "Quiet fog", "Distant thunder"]
             )
-        if self.random.random() < 0.4:
+        if cause != "move" and self.random.random() < 0.4:
             ambient = director.ambient_world_event(world)
             self._add_event(world, "world", ambient)
             memory.remember("world", f"ambient:{world.tick}", ambient, world.tick, importance=4, tags=["world"])
@@ -769,7 +924,7 @@ class WorldEngine:
                 location.name = name.strip()[:40]
                 renamed_locations[old_name] = location.name
             if isinstance(summary, str) and summary.strip():
-                location.summary = summary.strip()[:160]
+                location.summary = summary.strip()[:110]
 
         for npc in world.npcs:
             if npc.location_name in renamed_locations:
@@ -795,7 +950,7 @@ class WorldEngine:
 
         hooks = [hook.strip() for hook in details.get("quest_hooks", []) if isinstance(hook, str) and hook.strip()]
         if hooks:
-            world.quest_hooks = hooks[:6]
+            world.quest_hooks = [hook[:130] for hook in hooks[:6]]
 
         archetypes = [item.strip().lower() for item in details.get("player_archetypes", []) if isinstance(item, str) and item.strip()]
         if archetypes:
@@ -824,6 +979,34 @@ class WorldEngine:
         homelands = [item.strip() for item in details.get("homelands", []) if isinstance(item, str) and item.strip()]
         if homelands:
             world.homeland_options = homelands[:8]
+
+        homeland_descriptions = details.get("homeland_descriptions")
+        if isinstance(homeland_descriptions, dict):
+            world.homeland_descriptions = {
+                key: value
+                for key, value in homeland_descriptions.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+
+        inventory = [item.strip().lower() for item in details.get("starting_inventory", []) if isinstance(item, str) and item.strip()]
+        if inventory:
+            world.starting_inventory = inventory[:5]
+
+        inventory_descriptions = details.get("inventory_descriptions")
+        if isinstance(inventory_descriptions, dict):
+            world.inventory_descriptions = {
+                key: value
+                for key, value in inventory_descriptions.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+
+        skill_descriptions = details.get("skill_descriptions")
+        if isinstance(skill_descriptions, dict):
+            world.skill_descriptions = {
+                key: value
+                for key, value in skill_descriptions.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
 
         opening_event = details.get("opening_event")
         if isinstance(opening_event, str) and opening_event.strip():

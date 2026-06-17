@@ -130,6 +130,14 @@ class WorldEngine:
 
         if text.startswith("inspect "):
             target = raw_command.split(maxsplit=1)[1].strip()
+            cleaned_target = self._clean_item_name(target)
+            visible_items = self.scene_objects_at(world, player.position)
+            if not (
+                self._matches_known_object(cleaned_target, player.inventory)
+                or self._matches_known_object(cleaned_target, visible_items)
+                or self._object_state_for_target(world, player.position, cleaned_target) is not None
+            ):
+                return self._resolve_freeform_action(raw_command, world, player, director, memory, location, npc, memory_context)
             return CommandResult(self._inspect_target(target, world, player, location))
 
         if text.startswith("use "):
@@ -436,12 +444,12 @@ class WorldEngine:
         if beat.mechanical_request == "social_check" or "social" in tags:
             return ["press for details", "offer help", "change the subject"]
         if beat.mechanical_request == "exploration_check" or "exploration" in tags:
-            return ["search carefully", "follow the clue", "inspect the find"]
+            return ["search carefully", "follow the clue", "inspect the scene"]
         if "dialogue" in tags or "rumor" in tags:
             return ["press for details", "ask who else knows", "change the subject"]
         if "rest" in tags:
             return ["keep watch", "pack up", "push onward"]
-        return ["inspect the scene", "press deeper", "change approach"]
+        return ["press deeper", "change approach", "reassess"]
 
     def _merge_choices(self, primary: list[str], secondary: list[str], limit: int = 4) -> list[str]:
         merged: list[str] = []
@@ -498,8 +506,8 @@ class WorldEngine:
         if beat.mechanical_request == "exploration_check" or "exploration" in beat.tags:
             if success:
                 return {
-                    "prompt": f"Next: inspect the find, follow it deeper, or leave {place} for now.",
-                    "choices": ["inspect the find", "follow it deeper", "leave for now"],
+                    "prompt": f"Next: inspect the scene, follow it deeper, or leave {place} for now.",
+                    "choices": ["inspect the scene", "follow it deeper", "leave for now"],
                 }
             return {
                 "prompt": "Next: look again, change tactics, or fall back and recover.",
@@ -516,8 +524,8 @@ class WorldEngine:
                 "choices": ["force the exit", "hold position", "study the scene"],
             }
         return {
-            "prompt": "Next: inspect the scene, change approach, or push onward.",
-            "choices": ["inspect the scene", "change approach", "push onward"],
+            "prompt": "Next: change approach, press deeper, or reassess.",
+            "choices": ["change approach", "press deeper", "reassess"],
         }
 
     def _ensure_progression(self, world: World) -> None:
@@ -796,6 +804,7 @@ class WorldEngine:
             "take",
             "get",
             "grab",
+            "inspect",
             "burn",
             "destroy",
             "break",

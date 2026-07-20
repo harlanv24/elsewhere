@@ -29,6 +29,7 @@ from worldsim.models import (
     TurnRecord,
     World,
 )
+from worldsim.navigation import NavigationService
 from worldsim.progression import ProgressionService
 from worldsim.scenes import SceneService
 from worldsim.turn_effects import TurnEffectService
@@ -43,6 +44,7 @@ class WorldEngine:
         self.progression = ProgressionService(self)
         self.turn_effects = TurnEffectService(self)
         self.scene_service = SceneService(self)
+        self.navigation = NavigationService()
 
     def create_world(self, director: Director | None = None, theme_prompt: str | None = None) -> World:
         width = 96
@@ -68,6 +70,7 @@ class WorldEngine:
         if director is not None:
             self._apply_world_details(world, director.generate_world_details(world))
         self._ensure_entity_ids(world)
+        self.navigation.ensure_graph(world)
         self._ensure_progression(world)
         self._refresh_alerts(world, None)
         return world
@@ -106,6 +109,7 @@ class WorldEngine:
         if not text:
             return CommandResult("Type a command. Try `help` if you want the list.")
         self._ensure_entity_ids(world)
+        self.navigation.ensure_graph(world)
         self._ensure_progression(world)
         self._ensure_legacy_encounter(world)
         self._sync_scene(world, player)
@@ -152,7 +156,18 @@ class WorldEngine:
 
         if text == "help":
             return CommandResult(
-                "Commands: north south east west, look, explore, enter area <name>, leave area, push deeper, pull back, force exit, talk, say <message>, end conversation, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, campaign status, resolve finale, abandon campaign, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare prose is dialogue; quit, help, inventory, and end conversation remain global commands, and other commands can be prefixed with /."
+                "Commands: north south east west, travel to <location>, look, "
+                "explore, enter area <name>, leave area, push deeper, pull back, "
+                "force exit, talk, say <message>, end conversation, attack, rest, "
+                "wait, inventory, inspect <item>, use <item>, drop <item>, "
+                "take <item>, campaign status, resolve finale, abandon campaign, "
+                "help, quit. Named travel follows the location graph; cardinal "
+                "movement explores wilderness tiles. The DM may request "
+                "exploration, social, or combat checks; the engine rolls them "
+                "using class and item bonuses. While speaking with an NPC, bare "
+                "prose is dialogue; quit, help, inventory, and end conversation "
+                "remain global commands, and other commands can be prefixed "
+                "with /."
             )
 
         if text in {"north", "south", "east", "west", "n", "s", "e", "w"} or text.startswith("move "):
@@ -846,6 +861,7 @@ class WorldEngine:
     def summary_counts(self, world: World) -> dict[str, int]:
         return {
             "locations": len(world.locations),
+            "routes": len(world.routes),
             "npcs": len(world.npcs),
             "events": len(world.recent_events),
             "hooks": len(world.quest_hooks),
@@ -858,6 +874,12 @@ class WorldEngine:
         self._ensure_entity_ids(world)
         self._ensure_progression(world)
         self._ensure_legacy_encounter(world)
+
+    def ensure_navigation(self, world: World) -> None:
+        """Build or validate the engine-owned location graph."""
+
+        self._ensure_entity_ids(world)
+        self.navigation.ensure_graph(world)
 
     def _resolve_freeform_action(
         self,
@@ -918,7 +940,16 @@ class WorldEngine:
             rejected_effects=rejected,
             authoritative_summary=self.turn_effects.summarize(check, accepted, rejected),
         )
-        choices, follow_up_prompt = self._turn_choices(intent, check, location, npc)
+        outcome_npc = self.scene_service.active_npc(
+            world,
+            self.npc_at(outcome_location, world),
+        )
+        choices, follow_up_prompt = self._turn_choices(
+            intent,
+            check,
+            outcome_location,
+            outcome_npc,
+        )
         world.current_choices = choices
         record = TurnRecord(
             id=turn_id,
@@ -929,10 +960,6 @@ class WorldEngine:
             outcome=outcome,
             narration="",
             choices=choices,
-        )
-        outcome_npc = self.scene_service.active_npc(
-            world,
-            self.npc_at(outcome_location, world),
         )
         narration = director.narrate_turn_outcome(
             world,
@@ -946,7 +973,7 @@ class WorldEngine:
         world.turn_records.append(record)
         del world.turn_records[:-100]
 
-        place = location.name if location else "the wilds"
+        place = outcome_location.name if outcome_location else "the wilds"
         fact = f"{player.name} near {place}: {outcome.authoritative_summary}"
         self._remember_state_fact(world, fact, world.tick)
         memory.remember(

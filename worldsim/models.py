@@ -153,6 +153,28 @@ class Location:
 
 
 @dataclass
+class LocationRoute:
+    """Engine-owned narrative connection between two stable location IDs."""
+
+    id: str
+    origin_id: str
+    destination_id: str
+    path: list[Position]
+    kind: str = "road"
+    danger: int = 1
+
+    def connects(self, location_id: str) -> bool:
+        return location_id in {self.origin_id, self.destination_id}
+
+    def other(self, location_id: str) -> str | None:
+        if location_id == self.origin_id:
+            return self.destination_id
+        if location_id == self.destination_id:
+            return self.origin_id
+        return None
+
+
+@dataclass
 class Npc:
     name: str
     role: str
@@ -494,6 +516,7 @@ class World:
     epilogue: str | None = None
     ending_reason: str | None = None
     turn_records: list[TurnRecord] = field(default_factory=list)
+    routes: list[LocationRoute] = field(default_factory=list)
 
 
 @dataclass

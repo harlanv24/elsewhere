@@ -19,12 +19,13 @@ from textual.widgets import Button, Input, RichLog, Static
 from textual.widgets._content_switcher import ContentSwitcher
 from textual.widgets._tabbed_content import TabPane, TabbedContent
 
+from worldsim.ascii_render import AsciiRenderer
 from worldsim.command_input import normalize_command_input
 from worldsim.debug import DebugLogger
 from worldsim.director import director_from_env
 from worldsim.engine import WorldEngine
 from worldsim.memory import CampaignMemory, CampaignStore
-from worldsim.models import Biome, Location, Npc, Player, Position, SceneMode, World
+from worldsim.models import Location, Npc, Player, Position, SceneMode, World
 from worldsim.usage import TokenUsageTracker, UsageTotals, format_tokens
 
 if TYPE_CHECKING:
@@ -235,6 +236,7 @@ class WorldSimApp(App[None]):
         super().__init__()
         self.store = store
         self.engine = engine or WorldEngine()
+        self.ascii_renderer = AsciiRenderer()
         self.debug_logger = debug_logger
         self.director = director_from_env(self.engine.seed, debug_logger)
         self.session: Session | None = None
@@ -608,6 +610,7 @@ class WorldSimApp(App[None]):
             return
         world, player, memory = self.loaded_session
         self.engine.ensure_progression(world)
+        self.engine.ensure_navigation(world)
         memory.remember_world_state(world, player)
         self.session = Session(
             world=world,
@@ -628,6 +631,7 @@ class WorldSimApp(App[None]):
             return "No saved campaign found.\nCreate a new world to begin."
         world, player, memory = self.loaded_session
         self.engine.ensure_progression(world)
+        self.engine.ensure_navigation(world)
         modified = "unknown"
         if self.store.path.exists():
             modified = datetime.fromtimestamp(self.store.path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
@@ -1093,60 +1097,86 @@ class WorldSimApp(App[None]):
         assert self.session is not None
         world = self.session.world
         player = self.session.player
-        location_positions = {location.position: location.name[0].upper() for location in world.locations}
         text = Text(no_wrap=True)
         view_width, view_height = self._viewport_tile_size()
-        if self.follow_player and not self._player_in_camera_view(world, player, view_width, view_height):
-            self._track_player_in_view()
-        start_x = self._clamp_camera(self.camera_x, world.width, view_width)
-        start_y = self._clamp_camera(self.camera_y, world.height, view_height)
-        end_x = min(world.width, start_x + view_width)
-        end_y = min(world.height, start_y + view_height)
+        local = (
+            world.active_scene is not None
+            and world.active_scene.mode == SceneMode.LOCAL
+        )
+        if local:
+            composition = self.ascii_renderer.compose_local(
+                world,
+                player,
+                view_width,
+                view_height,
+            )
+            start_x = 0
+            start_y = 0
+            end_x = composition.width
+            end_y = composition.height
+        else:
+            composition = self.ascii_renderer.compose_overworld(world, player)
+            if (
+                self.follow_player
+                and not self._player_in_camera_view(
+                    world,
+                    player,
+                    view_width,
+                    view_height,
+                )
+            ):
+                self._track_player_in_view()
+            start_x = self._clamp_camera(
+                self.camera_x,
+                world.width,
+                view_width,
+            )
+            start_y = self._clamp_camera(
+                self.camera_y,
+                world.height,
+                view_height,
+            )
+            end_x = min(world.width, start_x + view_width)
+            end_y = min(world.height, start_y + view_height)
 
         for y in range(start_y, end_y):
             for x in range(start_x, end_x):
-                pos = Position(x, y)
-                if pos == player.position:
-                    text.append("@@", style="bold #111827 on #fde047")
-                elif pos in location_positions:
-                    label = location_positions[pos]
-                    text.append(f"{label}*", style="bold #ffe4f2 on #ec4899")
-                else:
-                    glyph, style = self._tile_token(world, x, y)
-                    text.append(glyph, style=style)
+                cell = composition.cell(Position(x, y))
+                text.append(
+                    cell.token,
+                    style=self._map_role_style(cell.role),
+                )
             if y < end_y - 1:
                 text.append("\n")
         return text
 
-    def _tile_token(self, world: World, x: int, y: int) -> tuple[str, str]:
-        biome = world.tiles[y][x]
-        variant = (x * 17 + y * 31 + world.seed) % 4
-        near_water = self._has_neighbor(world, x, y, Biome.WATER)
-        near_mountain = self._has_neighbor(world, x, y, Biome.MOUNTAIN)
-
-        if biome == Biome.WATER:
-            tokens = ["~~", "~.", ".~", "=="] if near_water else ["..", " .", "..", " ."]
-            styles = ["bold #60a5fa on #0b1f3a", "bold #38bdf8 on #082032", "bold #7dd3fc on #0a2540", "bold #93c5fd on #092844"]
-            return tokens[variant], styles[variant]
-        if biome == Biome.PLAIN:
-            tokens = ["..", " .", " ,", ",."] if not near_water else ["' ", ".'", ", ", " ."]
-            styles = ["#d6d3b3 on #1b1f1a", "#cbd5a1 on #1d2318", "#e5d8a8 on #21251a", "#d1d5b2 on #191f18"]
-            return tokens[variant], styles[variant]
-        if biome == Biome.FOREST:
-            tokens = ["tt", "YY", "||", "tt"] if not near_mountain else ["t^", "Y^", "t|", "Y|"]
-            styles = ["bold #4ade80 on #0d2417", "bold #86efac on #0f2a19", "bold #22c55e on #0c2013", "bold #65a30d on #15240f"]
-            return tokens[variant], styles[variant]
-        if biome == Biome.HILL:
-            tokens = ["^^", "n^", "^^", "~^"]
-            styles = ["bold #fbbf24 on #2b1f12", "bold #f59e0b on #31200f", "bold #fcd34d on #38240f", "bold #f59e0b on #2f2214"]
-            return tokens[variant], styles[variant]
-        if biome == Biome.MOUNTAIN:
-            tokens = ["/\\", "A^", "MM", "/^"]
-            styles = ["bold #e5e7eb on #2a2f3a", "bold #f8fafc on #313948", "bold #cbd5e1 on #252b35", "bold #dbeafe on #2e3440"]
-            return tokens[variant], styles[variant]
-        tokens = [";;", "::", ",;", ";,"]
-        styles = ["bold #a3e635 on #21301a", "bold #84cc16 on #1d2a14", "bold #65a30d on #1b2618", "bold #bef264 on #233117"]
-        return tokens[variant], styles[variant]
+    def _map_role_style(self, role: str) -> str:
+        return {
+            "player": "bold #111827 on #fde047",
+            "npc": "bold #dbeafe on #2563eb",
+            "object": "bold #052e16 on #34d399",
+            "hazard": "bold #fff7ed on #dc2626",
+            "quest": "bold #2e1065 on #facc15",
+            "label": "bold #fce7f3 on #831843",
+            "landmark": "bold #ffe4f2 on #ec4899",
+            "local_landmark": "bold #fde68a on #78350f",
+            "road": "bold #fef3c7 on #78350f",
+            "trail": "#fde68a on #3f2d20",
+            "ferry": "bold #e0f2fe on #075985",
+            "river": "bold #7dd3fc on #082f49",
+            "coast": "bold #bae6fd on #0c4a6e",
+            "water": "bold #60a5fa on #0b1f3a",
+            "plain": "#d6d3b3 on #1b1f1a",
+            "forest": "bold #4ade80 on #0d2417",
+            "hill": "bold #fbbf24 on #2b1f12",
+            "mountain": "bold #e5e7eb on #2a2f3a",
+            "swamp": "bold #a3e635 on #21301a",
+            "terrain_boundary": "#e5d8a8 on #25221a",
+            "local_wall": "bold #cbd5e1 on #334155",
+            "local_floor": "#a8a29e on #1c1917",
+            "local_path": "#fde68a on #422006",
+            "exit": "bold #ecfccb on #3f6212",
+        }.get(role, "#d1d5db on #111827")
 
     def _region_text(self, location: Location | None) -> str:
         assert self.session is not None
@@ -1160,11 +1190,24 @@ class WorldSimApp(App[None]):
             lines.append("Location: Unmapped scene")
             lines.append("No named location anchors this ground.")
         else:
+            locations = {
+                item.id: item.name
+                for item in world.locations
+            }
+            route_names = [
+                locations[destination_id]
+                for destination_id in self.engine.navigation.neighbor_ids(
+                    world,
+                    location.id,
+                )
+                if destination_id in locations
+            ]
             lines.extend(
                 [
                     f"Location: {location.name}",
                     f"Danger: {location.danger}/9",
                     location.summary,
+                    "Routes: " + (", ".join(route_names) or "none"),
                 ]
             )
         return "\n".join(lines)
@@ -1193,6 +1236,7 @@ class WorldSimApp(App[None]):
                 f"World Age: {world.tick} turns",
                 f"Map Size: {world.width} x {world.height}",
                 f"Locations: {counts['locations']}",
+                f"Routes: {counts['routes']}",
                 f"NPCs: {counts['npcs']}",
                 f"Hooks: {counts['hooks']}",
                 f"Weather: {world.weather}",
@@ -2092,14 +2136,3 @@ class WorldSimApp(App[None]):
             self._handle_command("look")
             return
         self._handle_command(choice)
-
-    def _has_neighbor(self, world: World, x: int, y: int, biome: Biome) -> bool:
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                nx = x + dx
-                ny = y + dy
-                if 0 <= nx < world.width and 0 <= ny < world.height and world.tiles[ny][nx] == biome:
-                    return True
-        return False

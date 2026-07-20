@@ -26,6 +26,7 @@ from worldsim.models import (
     EncounterStatus,
     Event,
     Location,
+    LocationRoute,
     Npc,
     Player,
     Position,
@@ -46,7 +47,7 @@ from worldsim.schemas import turn_record_to_payload
 from worldsim.usage import UsageTotals
 
 
-SAVE_SCHEMA_VERSION = 4
+SAVE_SCHEMA_VERSION = 5
 
 
 class UnsupportedSaveVersion(ValueError):
@@ -234,6 +235,20 @@ class CampaignStore:
                 }
                 for location in world.locations
             ],
+            "routes": [
+                {
+                    "id": route.id,
+                    "origin_id": route.origin_id,
+                    "destination_id": route.destination_id,
+                    "path": [
+                        {"x": position.x, "y": position.y}
+                        for position in route.path
+                    ],
+                    "kind": route.kind,
+                    "danger": route.danger,
+                }
+                for route in world.routes
+            ],
             "npcs": [asdict(npc) for npc in world.npcs],
             "recent_events": [asdict(event) for event in world.recent_events],
             "quest_hooks": list(world.quest_hooks),
@@ -310,6 +325,24 @@ class CampaignStore:
             height=payload["height"],
             tiles=tiles,
             locations=locations,
+            routes=[
+                LocationRoute(
+                    id=str(route.get("id", "")),
+                    origin_id=str(route.get("origin_id", "")),
+                    destination_id=str(route.get("destination_id", "")),
+                    path=[
+                        Position(int(position["x"]), int(position["y"]))
+                        for position in route.get("path", [])
+                        if isinstance(position, dict)
+                        and isinstance(position.get("x"), int)
+                        and isinstance(position.get("y"), int)
+                    ],
+                    kind=str(route.get("kind", "road")),
+                    danger=int(route.get("danger", 1)),
+                )
+                for route in payload.get("routes", [])
+                if isinstance(route, dict)
+            ],
             npcs=npcs,
             recent_events=recent_events,
             quest_hooks=list(payload["quest_hooks"]),
@@ -416,6 +449,16 @@ class CampaignStore:
             "homeland_descriptions": dict(world.homeland_descriptions),
             "player": self._serialize_player(player),
             "current_position": position_key,
+            "routes": [
+                {
+                    "id": route.id,
+                    "origin_id": route.origin_id,
+                    "destination_id": route.destination_id,
+                    "kind": route.kind,
+                    "danger": route.danger,
+                }
+                for route in world.routes
+            ],
             "visible_scene_objects": list(world.scene_objects.get(position_key, [])),
             "object_states": world.object_states,
             "conversations": {key: lines[-12:] for key, lines in world.conversations.items()},
@@ -448,6 +491,9 @@ class CampaignStore:
         if version == 3:
             payload = self._migrate_v3_to_v4(payload)
             version = 4
+        if version == 4:
+            payload = self._migrate_v4_to_v5(payload)
+            version = 5
         if version != SAVE_SCHEMA_VERSION:
             raise UnsupportedSaveVersion(f"No migration path from campaign save version {version}.")
         return payload
@@ -698,6 +744,17 @@ class CampaignStore:
             resolved.append(encounter["id"])
         world.setdefault("resolved_encounter_ids", resolved)
         payload["schema_version"] = 4
+        return payload
+
+    def _migrate_v4_to_v5(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        world = payload.get("world")
+        if not isinstance(world, dict):
+            raise ValueError("Version 4 campaign save must contain a world object.")
+        world.setdefault("routes", [])
+        payload["schema_version"] = 5
         return payload
 
     def _serialize_quest(self, quest: Quest) -> dict[str, object]:

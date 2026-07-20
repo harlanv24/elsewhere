@@ -13,7 +13,10 @@ That keeps the game coherent while still allowing an LLM to improvise.
 
 - Colorized TUI built with `textual`
 - Top tabs, bordered panels, and a command bar closer to the reference layout
-- Procedural world map with biome coloring
+- Procedural world map with biome coloring, routes, landmark sprites, labels,
+  coast/river boundaries, and state overlays
+- Deterministic named-location graph with terrain-aware roads, trails, and
+  ferries
 - Named locations and NPCs
 - Player creation with archetype selection
 - Command loop for moving, exploring, talking, resting, fighting, and waiting
@@ -23,7 +26,7 @@ That keeps the game coherent while still allowing an LLM to improvise.
 - A `MockDirector` that behaves like a local DM
 - A `Director` interface where a real LLM backend can be plugged in later
 - Optional local LLM director using JSON prompts and OpenAI-compatible chat completions
-- Versioned campaign saves with migrations from schema versions 0 through 3
+- Versioned campaign saves with migrations from schema versions 0 through 4
 - Persisted, replayable turn records for freeform and local-scene actions
 - Engine-owned local scenes, depth, tension, hazards, exits, and dialogue state
 - Condition-driven quest stages, prerequisite chains, structured clock triggers,
@@ -41,6 +44,7 @@ python3 main.py
 
 - `north` / `south` / `east` / `west`
 - `move north`
+- `travel to <location>` for a directly connected named route
 - `look`
 - `explore`
 - `enter area <name>`
@@ -68,6 +72,10 @@ During an active conversation, bare prose is dialogue. Global commands such as
 `quit`, `help`, `inventory`, and `end conversation` remain commands without a
 leading slash.
 
+Cardinal movement traverses individual terrain tiles. Named travel is separate:
+`travel to <location>` can only commit a transition when the destination is
+directly connected to the current named location by the persisted route graph.
+
 ## Architecture
 
 `worldsim/models.py`
@@ -89,6 +97,19 @@ leading slash.
 `worldsim/turn_effects.py`
 
 - Focused freeform-effect preparation, legality policy, and commit handlers
+- Graph validation for named-location transitions
+
+`worldsim/navigation.py`
+
+- Deterministic connected location-graph generation
+- Terrain-aware road, trail, and ferry paths
+- Route adjacency, reachability, and shortest-path queries
+
+`worldsim/ascii_render.py`
+
+- Textual-independent overworld and local-scene composition
+- Layered terrain, boundaries, water, routes, sprites, labels, and overlays
+- Deterministic collision policy for routes, landmarks, and labels
 
 `worldsim/scenes.py`
 
@@ -177,12 +198,13 @@ The engine then:
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
 
-The architecture is currently in a phased migration. Phase 5 now gives each LLM
-task its own prompt and response schema, selects only task-relevant world state,
-enforces a configurable context budget, validates model output, and makes one
-bounded repair request before falling back. See
-[`docs/phase-5-context-contracts.md`](docs/phase-5-context-contracts.md) for the
-runtime contract and budget behavior. See
+The architecture is currently in a phased migration. Phase 6 separates named
+travel from wilderness movement with a persisted location graph and replaces
+TUI-owned map logic with deterministic overworld and local-scene compositors.
+See
+[`docs/phase-6-navigation-rendering.md`](docs/phase-6-navigation-rendering.md)
+for route, layer, and collision behavior. Phase 5 LLM details remain in
+[`docs/phase-5-context-contracts.md`](docs/phase-5-context-contracts.md). See
 [`docs/architecture-audit.md`](docs/architecture-audit.md) for the verified
 baseline findings, ownership model, phase gates, and compatibility risks.
 
@@ -296,13 +318,15 @@ The System tab shows the exact debug log path for the current session.
 
 ## Save Schema
 
-`data/campaign.json` now includes `schema_version: 4`. Existing saves without a
-version are treated as version 0; schema versions 1 through 3 are migrated in
+`data/campaign.json` now includes `schema_version: 5`. Existing saves without a
+version are treated as version 0; schema versions 1 through 4 are migrated in
 memory when loaded. The migrations backfill stable location/NPC IDs, structured
 encounters, turn history, local-scene lifecycle fields, typed quest stages,
-campaign status, finale requirements, and resolved encounter IDs. The next save
-writes version 4. Saves from a newer unsupported schema fail with an explicit
-error instead of being misread.
+campaign status, finale requirements, resolved encounter IDs, and the route
+collection. Version-4 saves start with an empty route collection; the engine
+deterministically regenerates and persists it when the campaign is resumed. The
+next save writes version 5. Saves from a newer unsupported schema fail with an
+explicit error instead of being misread.
 
 Both `campaign.json` and the debug `state.json` mirror are written through a
 temporary file followed by atomic replacement.
@@ -318,12 +342,13 @@ python -m compileall -q main.py worldsim tests
 ```
 
 The deterministic suite covers the Phase 1 safety boundary, Phase 2 turn
-resolution, Phase 3 scene persistence, Phase 4 campaign resolution, and Phase 5
-LLM context contracts. It includes condition-grounded quest completion,
-irrelevant evidence, dialogue recruitment, prerequisite activation, structured
-clock consequences, finale victory/defeat, terminal command gating, replay,
-save migration, unrelated-context exclusion, budget enforcement, and bounded
-schema repair.
+resolution, Phase 3 scene persistence, Phase 4 campaign resolution, Phase 5 LLM
+context contracts, and Phase 6 navigation/rendering. It includes
+condition-grounded quest completion, irrelevant evidence, dialogue recruitment,
+prerequisite activation, structured clock consequences, finale victory/defeat,
+terminal command gating, replay, save migration, unrelated-context exclusion,
+budget enforcement, bounded schema repair, seeded map snapshots, graph
+reachability, and landmark/route collision checks.
 
 When debugging a live LLM turn, compare:
 

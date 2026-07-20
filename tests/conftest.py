@@ -102,6 +102,8 @@ class ScriptedDirector(Director):
                 "object_states": dict(world.object_states),
                 "check": record.check,
                 "outcome": record.outcome,
+                "player_position": player.position,
+                "location_id": location.id if location is not None else None,
             }
         )
         if self.outcome_narration is not None:

@@ -61,11 +61,12 @@ def test_failed_action_does_not_mutate_inventory_or_scene_state(game_state) -> N
     result = resolve(state, "break iron door")
 
     assert "failure" in (state.world.last_roll or "")
-    assert "authoritative effects rejected" in state.world.state_facts[-1]
+    assert "Rejected" in state.world.state_facts[-1]
     assert state.player.inventory == inventory_before
     assert state.world.scene_objects == scene_before
     assert state.world.object_states == objects_before
-    assert "door gives way" in result.message
+    assert "fails" in result.message
+    assert "door gives way" not in result.message
 
 
 def test_successful_exploration_escape_clears_encounter_and_legacy_lock(game_state) -> None:

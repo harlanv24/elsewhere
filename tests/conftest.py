@@ -8,6 +8,7 @@ from worldsim.director import Director
 from worldsim.engine import WorldEngine
 from worldsim.memory import CampaignMemory
 from worldsim.models import (
+    ActionIntent,
     Biome,
     DirectorBeat,
     Location,
@@ -16,6 +17,7 @@ from worldsim.models import (
     Position,
     Quest,
     QuestClock,
+    TurnRecord,
     World,
 )
 
@@ -28,6 +30,9 @@ class ScriptedDirector(Director):
             title="Dialogue",
             narration="The witness answers cautiously.",
         )
+        self.interpretation_observations: list[dict[str, object]] = []
+        self.narration_observations: list[dict[str, object]] = []
+        self.outcome_narration: str | None = None
 
     def introduce_world(self, world, player, memory_context=None) -> str:
         return "The campaign begins."
@@ -54,6 +59,61 @@ class ScriptedDirector(Director):
         memory_context=None,
     ) -> DirectorBeat:
         return self.freeform_beat
+
+    def interpret_freeform_action(
+        self,
+        world,
+        player,
+        action,
+        location,
+        npc,
+        intent_id,
+        memory_context=None,
+    ) -> ActionIntent:
+        self.interpretation_observations.append(
+            {
+                "scene_objects": list(world.scene_objects.get(f"{player.position.x},{player.position.y}", [])),
+                "object_states": dict(world.object_states),
+                "last_roll": world.last_roll,
+            }
+        )
+        return super().interpret_freeform_action(
+            world,
+            player,
+            action,
+            location,
+            npc,
+            intent_id,
+            memory_context,
+        )
+
+    def narrate_turn_outcome(
+        self,
+        world,
+        player,
+        location,
+        npc,
+        record: TurnRecord,
+        memory_context=None,
+    ) -> str:
+        self.narration_observations.append(
+            {
+                "scene_objects": list(world.scene_objects.get(f"{player.position.x},{player.position.y}", [])),
+                "object_states": dict(world.object_states),
+                "check": record.check,
+                "outcome": record.outcome,
+            }
+        )
+        if self.outcome_narration is not None:
+            return self.outcome_narration
+        return super().narrate_turn_outcome(
+            world,
+            player,
+            location,
+            npc,
+            record,
+            memory_context,
+        )
 
     def respond_to_dialogue(
         self,

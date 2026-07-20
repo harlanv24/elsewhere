@@ -20,6 +20,7 @@ from textual.widgets._content_switcher import ContentSwitcher
 from textual.widgets._tabbed_content import TabPane, TabbedContent
 
 from worldsim import area
+from worldsim.command_input import normalize_command_input
 from worldsim.debug import DebugLogger
 from worldsim.director import director_from_env
 from worldsim.engine import WorldEngine
@@ -508,13 +509,7 @@ class WorldSimApp(App[None]):
             command_input.focus()
 
     def _command_from_input(self, entered: str) -> str:
-        if not entered:
-            return ""
-        if entered.startswith("/"):
-            return entered[1:].strip()
-        if self._dialogue_npc() is not None:
-            return f"say {entered}"
-        return entered
+        return normalize_command_input(entered, dialogue_active=self._dialogue_npc() is not None)
 
     def _input_echo(self, entered: str, command: str) -> str:
         if command.startswith("say ") and not entered.startswith("/"):
@@ -527,7 +522,13 @@ class WorldSimApp(App[None]):
             return None
         location = self.engine.location_at(self.session.world, self.session.player.position)
         npc = self.engine.npc_at(location, self.session.world)
-        if npc is None or not self.session.world.conversations.get(npc.name):
+        dialogue = self.session.world.dialogue_state
+        if (
+            npc is None
+            or dialogue is None
+            or not dialogue.active
+            or dialogue.npc_id not in {npc.id, npc.name}
+        ):
             return None
         return npc
 
@@ -1679,7 +1680,8 @@ class WorldSimApp(App[None]):
                 "- arrow keys move",
                 "- talk starts or advances NPC dialogue",
                 "- while speaking with an NPC, bare input is dialogue",
-                "- prefix commands with / during NPC dialogue",
+                "- quit, help, inventory, and end conversation stay global",
+                "- prefix other commands with / during NPC dialogue",
                 "- shift+arrows pan the map",
                 "- c recenters on the player",
                 "- f toggles follow/free camera mode",

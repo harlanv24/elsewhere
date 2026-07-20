@@ -48,6 +48,7 @@ Return structured beats with:
 - quest_progress_delta
 - complete_current_stage
 - clock_effects
+- facts_discovered
 """.strip()
 
 
@@ -111,7 +112,7 @@ class Director(ABC):
         npc: Npc,
         memory_context: list[str] | None = None,
         dialogue_history: list[str] | None = None,
-    ) -> str:
+    ) -> DirectorBeat | str:
         raise NotImplementedError
 
 
@@ -297,7 +298,7 @@ class MockDirector(Director):
         npc: Npc,
         memory_context: list[str] | None = None,
         dialogue_history: list[str] | None = None,
-    ) -> str:
+    ) -> DirectorBeat:
         del world, player, location, memory_context, dialogue_history
         replies = [
             f"{npc.name} weighs your words, then says, \"That changes what I am willing to tell you.\"",
@@ -305,8 +306,15 @@ class MockDirector(Director):
             f"{npc.name} studies you for a moment. \"Maybe you are useful after all.\"",
         ]
         if "help" in player_dialogue.lower():
-            return f"{npc.name} says, \"Help has a price, but I can point you toward trouble worth solving.\""
-        return self.random.choice(replies)
+            narration = f"{npc.name} says, \"Help has a price, but I can point you toward trouble worth solving.\""
+        else:
+            narration = self.random.choice(replies)
+        return DirectorBeat(
+            title="Conversation",
+            narration=narration,
+            tags=["dialogue", "social"],
+            choices=["press for details", "offer help", "end conversation"],
+        )
 
 
 class LocalLLMDirector(Director):
@@ -416,7 +424,7 @@ class LocalLLMDirector(Director):
         npc: Npc,
         memory_context: list[str] | None = None,
         dialogue_history: list[str] | None = None,
-    ) -> str:
+    ) -> DirectorBeat | str:
         context = director_context(
             world,
             player=player,
@@ -427,7 +435,7 @@ class LocalLLMDirector(Director):
             dialogue_history=dialogue_history,
         )
         try:
-            return self._request_text("respond_to_dialogue", context)
+            return self._request_beat("respond_to_dialogue", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("respond_to_dialogue", exc)
             return self.fallback.respond_to_dialogue(
@@ -520,6 +528,7 @@ def _llm_system_prompt() -> str:
         "For narration tasks, write two to five concise sentences grounded in current state and matching the theme's tone. Favor playable information, voice, and choices over lore exposition. Do not decide dice outcomes or mutate engine-owned resources. "
         "Treat context.world.quests and context.world.clocks as the campaign spine. Drive the active quest's current_stage forward instead of replacing it with a tangent. "
         "Use progress_summary for concrete evidence, commitments, discoveries, or consequences worth recording. quest_progress_delta is 0 for color, 1 for meaningful progress, and 2 for major progress. Set complete_current_stage only when the scene satisfies the current stage. "
+        "Use facts_discovered for short stable fact IDs or exact factual statements revealed by this beat; the engine validates quest conditions against committed facts. "
         "Use clock_effects only for existing clock IDs. Positive deltas worsen pressure; negative deltas reduce pressure. follow_up_hook is only a loose thread or rumor. "
         "Offer two to four short choices for most action, exploration, and dialogue beats. Choices should be concrete player actions. "
         "Request mechanical_request and difficulty for uncertainty: exploration_check for search, traversal, lore, hazards; social_check for persuasion, deception, intimidation, insight, negotiation; combat_check for violence, chases under threat, and direct physical danger. "

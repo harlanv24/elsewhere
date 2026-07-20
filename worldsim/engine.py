@@ -6,7 +6,27 @@ import secrets
 
 from worldsim.director import Director
 from worldsim.memory import CampaignMemory
-from worldsim.models import Biome, CommandResult, DirectorBeat, Event, Location, Npc, Player, Position, Quest, QuestClock, World
+from worldsim.models import (
+    Biome,
+    ClockTrigger,
+    ClockTriggerKind,
+    CommandResult,
+    Condition,
+    ConditionKind,
+    DialogueState,
+    DirectorBeat,
+    EncounterState,
+    EncounterStatus,
+    Event,
+    Location,
+    Npc,
+    Player,
+    Position,
+    Quest,
+    QuestClock,
+    SceneState,
+    World,
+)
 
 
 class WorldEngine:
@@ -37,6 +57,7 @@ class WorldEngine:
         world.quest_hooks = self._starting_hooks(locations)
         if director is not None:
             self._apply_world_details(world, director.generate_world_details(world))
+        self._ensure_entity_ids(world)
         self._ensure_progression(world)
         self._refresh_alerts(world, None)
         return world
@@ -45,7 +66,7 @@ class WorldEngine:
         start = world.locations[0]
         max_hp = {"warrior": 18, "rogue": 14, "mage": 12, "ranger": 16}.get(archetype, 14)
         boosts = dict(world.player_archetype_boosts.get(archetype, {}))
-        return Player(
+        player = Player(
             name=name,
             archetype=archetype,
             homeland=homeland,
@@ -57,6 +78,8 @@ class WorldEngine:
             inventory=list(world.starting_inventory[:8]),
             boosts=boosts,
         )
+        self._sync_scene(world, player)
+        return player
 
     def resolve_command(
         self,
@@ -72,16 +95,25 @@ class WorldEngine:
         text = raw_command.lower()
         if not text:
             return CommandResult("Type a command. Try `help` if you want the list.")
+        self._ensure_entity_ids(world)
         self._ensure_progression(world)
+        self._ensure_legacy_encounter(world)
+        self._sync_scene(world, player)
 
         if text in {"quit", "exit"}:
             return CommandResult("The world will wait.", should_quit=True)
 
+        if text in {"end conversation", "end dialogue", "goodbye"}:
+            if world.dialogue_state is None or not world.dialogue_state.active:
+                return CommandResult("You are not in an active conversation.")
+            world.dialogue_state.active = False
+            world.dialogue_state = None
+            return CommandResult("You end the conversation.")
+
         if text in {"flee", "retreat", "withdraw"}:
-            if world.movement_lock is None:
+            if self._movement_lock_reason(world) is None:
                 return CommandResult("There is nothing immediate holding you here.")
-            world.current_activity = None
-            world.movement_lock = None
+            self._resolve_active_encounter(world, EncounterStatus.ESCAPED, "The player withdrew from danger.")
             world.current_choices = []
             world.last_roll = None
             self._remember_state_fact(world, f"{player.name} withdrew from the immediate situation.", world.tick)
@@ -89,13 +121,14 @@ class WorldEngine:
 
         if text == "help":
             return CommandResult(
-                "Commands: north south east west, look, explore, talk, say <message>, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare text is dialogue and slash-prefixed text is a command, like /look."
+                "Commands: north south east west, look, explore, talk, say <message>, end conversation, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare prose is dialogue; quit, help, inventory, and end conversation remain global commands, and other commands can be prefixed with /."
             )
 
         if text in {"north", "south", "east", "west", "n", "s", "e", "w"} or text.startswith("move "):
-            if world.movement_lock is not None:
+            movement_lock = self._movement_lock_reason(world)
+            if movement_lock is not None:
                 return CommandResult(
-                    f"You cannot travel while {world.movement_lock}. Resolve the situation, choose an option, or type `flee`."
+                    f"You cannot travel while {movement_lock}. Resolve the situation, choose an option, or type `flee`."
                 )
             direction = text
             if text.startswith("move "):
@@ -105,6 +138,8 @@ class WorldEngine:
             if not result.advance_time:
                 return result
             self._advance_world(world, player, director, memory, "move")
+            world.dialogue_state = None
+            self._sync_scene(world, player)
             location = self.location_at(world, player.position)
             npc = self.npc_at(location, world)
             if location is not None:
@@ -161,13 +196,23 @@ class WorldEngine:
 
         if text == "explore":
             beat = director.respond_to_action(world, player, "explore", location, npc, memory_context)
-            self._apply_beat_context(world, beat)
-            self._remember_scene_objects(world, player.position, beat.scene_objects)
+            self._apply_beat_context(world, beat, player, location)
             success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
             place = location.name if location else "the wilds"
             follow_up = self._roll_follow_up("explore", success, beat, location, npc)
             world.current_choices = self._merge_choices(follow_up["choices"], beat.choices)
             if success:
+                self._remember_scene_objects(world, player.position, beat.scene_objects)
+                if (
+                    beat.mechanical_request == "exploration_check"
+                    and world.active_encounter is not None
+                    and world.active_encounter.movement_locked
+                ):
+                    self._resolve_active_encounter(
+                        world,
+                        EncounterStatus.ESCAPED,
+                        "A successful exploration action opened an alternate route.",
+                    )
                 gain = self.random.randint(2, 6)
                 player.gold += gain
                 player.xp += 3
@@ -208,11 +253,22 @@ class WorldEngine:
 
         if text == "talk":
             beat = director.respond_to_action(world, player, "talk", location, npc, memory_context)
-            self._apply_beat_context(world, beat)
-            self._remember_scene_objects(world, player.position, beat.scene_objects)
+            self._apply_beat_context(world, beat, player, location)
+            success = (
+                self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
+                if beat.mechanical_request is not None
+                else None
+            )
+            if success is not False:
+                self._remember_scene_objects(world, player.position, beat.scene_objects)
             if npc is None:
                 message = beat.narration
             else:
+                world.dialogue_state = DialogueState(
+                    npc_id=npc.id or npc.name,
+                    npc_name=npc.name,
+                    started_tick=world.tick,
+                )
                 player.xp += 1
                 if beat.follow_up_hook:
                     world.quest_hooks.insert(0, beat.follow_up_hook)
@@ -227,8 +283,10 @@ class WorldEngine:
                     tags=[npc.name, npc.location_name, "rumor"],
                 )
                 message = beat.narration
+                if world.last_roll and beat.mechanical_request is not None:
+                    message = f"{message}\n\n{world.last_roll}"
                 self._remember_dialogue(world, npc, f"{npc.name}: {beat.narration}")
-            self._apply_progression(world, player, beat, memory, location, None)
+            self._apply_progression(world, player, beat, memory, location, success)
             self._advance_world(world, player, director, memory, "talk")
             memory.remember_world_state(world, player)
             return CommandResult(message, advance_time=True)
@@ -240,7 +298,7 @@ class WorldEngine:
             if npc is None:
                 return CommandResult("There is no one here to answer.")
             history = self._dialogue_history(world, npc)
-            reply = director.respond_to_dialogue(
+            dialogue_response = director.respond_to_dialogue(
                 world,
                 player,
                 player_dialogue,
@@ -248,6 +306,25 @@ class WorldEngine:
                 npc,
                 memory_context,
                 history,
+            )
+            beat = (
+                dialogue_response
+                if isinstance(dialogue_response, DirectorBeat)
+                else DirectorBeat(title="Dialogue", narration=dialogue_response)
+            )
+            self._apply_beat_context(world, beat, player, location)
+            success = (
+                self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
+                if beat.mechanical_request is not None
+                else None
+            )
+            if success is not False:
+                self._remember_scene_objects(world, player.position, beat.scene_objects)
+            reply = beat.narration
+            world.dialogue_state = DialogueState(
+                npc_id=npc.id or npc.name,
+                npc_name=npc.name,
+                started_tick=world.dialogue_state.started_tick if world.dialogue_state is not None else world.tick,
             )
             self._remember_dialogue(world, npc, f"{player.name}: {player_dialogue}")
             self._remember_dialogue(world, npc, f"{npc.name}: {reply}")
@@ -262,14 +339,14 @@ class WorldEngine:
                 importance=7,
                 tags=[npc.name, npc.location_name, "dialogue"],
             )
-            self._apply_progression(world, player, DirectorBeat(title="Dialogue", narration=reply), memory, location, None)
+            self._apply_progression(world, player, beat, memory, location, success)
             self._advance_world(world, player, director, memory, "talk")
             memory.remember_world_state(world, player)
             return CommandResult(reply, advance_time=True)
 
         if text == "rest":
             beat = director.respond_to_action(world, player, "rest", location, npc, memory_context)
-            self._apply_beat_context(world, beat)
+            self._apply_beat_context(world, beat, player, location)
             self._remember_scene_objects(world, player.position, beat.scene_objects)
             heal = self.random.randint(2, 5)
             player.hp = min(player.max_hp, player.hp + heal)
@@ -288,8 +365,6 @@ class WorldEngine:
 
         if text == "attack":
             beat = director.respond_to_action(world, player, "attack", location, npc, memory_context)
-            self._apply_beat_context(world, beat)
-            self._remember_scene_objects(world, player.position, beat.scene_objects)
             if location is None:
                 self._advance_world(world, player, director, memory, "attack")
                 memory.remember_world_state(world, player)
@@ -301,10 +376,12 @@ class WorldEngine:
                 memory.remember_world_state(world, player)
                 return CommandResult(f"{location.name} is tense but quiet. Nothing attacks back.", advance_time=True)
 
+            self._apply_beat_context(world, beat, player, location)
             success = self._roll_attack(world, player, 10 + location.danger)
             follow_up = self._roll_follow_up("attack", success, beat, location, npc)
             world.current_choices = self._merge_choices(follow_up["choices"], beat.choices)
             if success:
+                self._remember_scene_objects(world, player.position, beat.scene_objects)
                 reward = self.random.randint(3, 8)
                 player.gold += reward
                 player.xp += 5
@@ -318,8 +395,7 @@ class WorldEngine:
                     tags=[location.name, "combat", "victory"],
                 )
                 memory.remember_location(location, world.tick)
-                world.current_activity = None
-                world.movement_lock = None
+                self._resolve_active_encounter(world, EncounterStatus.RESOLVED, "The immediate threat was defeated.")
                 message = f"{beat.narration}\n\n{world.last_roll} You drive the threat back and claim {reward} gold in salvage.\n{follow_up['prompt']}"
             else:
                 damage = self.random.randint(2, 6)
@@ -334,8 +410,7 @@ class WorldEngine:
                     tags=[location.name, "combat", "danger"],
                 )
                 memory.remember_location(location, world.tick)
-                world.current_activity = "combat"
-                world.movement_lock = "you are in a fight"
+                self._start_encounter(world, player, location, "Survive or overcome the hostile threat.")
                 message = f"{beat.narration}\n\n{world.last_roll} The fight turns against you. You take {damage} damage.\n{follow_up['prompt']}"
             self._apply_progression(world, player, beat, memory, location, success)
             self._advance_world(world, player, director, memory, "attack")
@@ -354,6 +429,110 @@ class WorldEngine:
             if location.position == position:
                 return location
         return None
+
+    def _ensure_entity_ids(self, world: World) -> None:
+        for index, location in enumerate(world.locations):
+            if not location.id:
+                location.id = f"location-{index + 1:03d}"
+        locations_by_name = {location.name: location for location in world.locations}
+        for index, npc in enumerate(world.npcs):
+            if not npc.id:
+                npc.id = f"npc-{index + 1:03d}"
+            location = locations_by_name.get(npc.location_name)
+            if location is not None:
+                npc.location_id = location.id
+
+    def _sync_scene(self, world: World, player: Player) -> None:
+        location = self.location_at(world, player.position)
+        location_id = location.id if location is not None else None
+        scene_id = (
+            f"scene:{location_id}"
+            if location_id is not None
+            else f"scene:{player.position.x},{player.position.y}"
+        )
+        if world.active_scene is None or world.active_scene.id != scene_id:
+            world.active_scene = SceneState(
+                id=scene_id,
+                location_id=location_id,
+                available_actions=list(world.current_choices),
+            )
+        else:
+            world.active_scene.location_id = location_id
+            world.active_scene.available_actions = list(world.current_choices)
+
+    def _ensure_legacy_encounter(self, world: World) -> None:
+        encounter = world.active_encounter
+        if encounter is not None and encounter.movement_locked:
+            world.current_activity = "combat"
+            world.movement_lock = "you are in a fight"
+            return
+        lock = world.movement_lock or ""
+        if encounter is not None and not encounter.movement_locked and (
+            world.current_activity == "combat"
+            or any(token in lock.lower() for token in ("fight", "combat"))
+        ):
+            world.current_activity = None
+            world.movement_lock = None
+            return
+        if encounter is None and (
+            world.current_activity == "combat"
+            or any(token in lock.lower() for token in ("fight", "combat"))
+        ):
+            world.active_encounter = EncounterState(
+                id=f"legacy-encounter-{world.tick}",
+                kind="combat",
+                participants=[],
+                objective="Resolve the legacy combat state.",
+                phase="engaged",
+                exits=["flee"],
+            )
+            world.current_activity = "combat"
+            world.movement_lock = "you are in a fight"
+
+    def _movement_lock_reason(self, world: World) -> str | None:
+        encounter = world.active_encounter
+        if encounter is not None and encounter.movement_locked:
+            return f"encounter {encounter.id} is active"
+        return world.movement_lock
+
+    def _start_encounter(
+        self,
+        world: World,
+        player: Player,
+        location: Location | None,
+        objective: str,
+    ) -> None:
+        if world.active_encounter is None or not world.active_encounter.movement_locked:
+            npc = self.npc_at(location, world)
+            participants = [player.name]
+            if npc is not None:
+                participants.append(npc.id or npc.name)
+            location_token = location.id if location is not None else f"{player.position.x}-{player.position.y}"
+            world.active_encounter = EncounterState(
+                id=f"encounter-{world.tick}-{location_token}",
+                kind="combat",
+                participants=participants,
+                objective=objective,
+                phase="engaged",
+                obstacles=["hostile pressure"],
+                exits=["flee", "alternate route", "negotiation"],
+            )
+        world.current_activity = "combat"
+        world.movement_lock = "you are in a fight"
+
+    def _resolve_active_encounter(
+        self,
+        world: World,
+        status: EncounterStatus,
+        resolution: str,
+    ) -> None:
+        encounter = world.active_encounter
+        if encounter is not None:
+            encounter.status = status
+            encounter.phase = "resolved"
+            encounter.resolution = resolution
+        world.current_activity = None
+        world.movement_lock = None
 
     def npc_at(self, location: Location | None, world: World) -> Npc | None:
         if location is None:
@@ -427,14 +606,23 @@ class WorldEngine:
         matching = [player.boosts.get(skill, 0) for skill in skill_groups.get(check_kind, set())]
         return max(matching, default=0)
 
-    def _apply_beat_context(self, world: World, beat: DirectorBeat) -> None:
+    def _apply_beat_context(
+        self,
+        world: World,
+        beat: DirectorBeat,
+        player: Player | None = None,
+        location: Location | None = None,
+    ) -> None:
         world.current_choices = list(beat.choices[:4]) or self._default_choices(beat)
         if beat.mechanical_request == "combat_check" or "combat" in beat.tags:
-            world.current_activity = "combat"
-            world.movement_lock = "you are in a fight"
+            if player is not None:
+                self._start_encounter(world, player, location, "Resolve the immediate hostile conflict.")
+            else:
+                world.current_activity = "combat"
+                world.movement_lock = "you are in a fight"
         elif beat.mechanical_request in {"exploration_check", "social_check"}:
             world.current_activity = beat.mechanical_request.replace("_check", "")
-            if world.movement_lock != "you are in a fight":
+            if world.active_encounter is None or not world.active_encounter.movement_locked:
                 world.movement_lock = None
 
     def _default_choices(self, beat: DirectorBeat) -> list[str]:
@@ -543,8 +731,32 @@ class WorldEngine:
                     value=1,
                     max_value=6,
                     description=world.overarching_quest,
+                    triggers=[
+                        ClockTrigger(
+                            id="central-threat-consequence",
+                            kind=ClockTriggerKind.STABILITY_DELTA,
+                            amount=-10,
+                            text="The central threat destabilizes the campaign.",
+                        ),
+                        ClockTrigger(
+                            id="central-threat-fact",
+                            kind=ClockTriggerKind.ADD_FACT,
+                            target_id="central_threat_reached_breaking_point",
+                            text="The central threat reached its breaking point.",
+                        ),
+                    ],
                 )
             ]
+        for clock in world.clocks:
+            if not clock.triggers:
+                clock.triggers.append(
+                    ClockTrigger(
+                        id=f"{clock.id}-breaking-point",
+                        kind=ClockTriggerKind.ADD_FACT,
+                        target_id=f"clock:{clock.id}:breaking_point",
+                        text=f"{clock.title} reached its breaking point.",
+                    )
+                )
         self._sync_active_quest_display(world)
 
     def _quest_from_hook(self, hook: str, index: int, world: World) -> Quest:
@@ -609,12 +821,18 @@ class WorldEngine:
     ) -> None:
         self._ensure_progression(world)
         progress_allowed = success is not False
+        if progress_allowed:
+            for fact in beat.facts_discovered:
+                normalized = " ".join(fact.split())
+                if normalized and normalized not in world.discovered_facts:
+                    world.discovered_facts.append(normalized)
+                    del world.discovered_facts[:-80]
+                    self._remember_state_fact(world, f"Fact discovered: {normalized}", world.tick)
         quest = self._active_quest(world)
         if quest is not None and progress_allowed:
             delta = beat.quest_progress_delta
-            if beat.progress_summary and delta == 0:
-                delta = 1
-            if delta or beat.complete_current_stage:
+            progress_attempted = bool(delta or beat.complete_current_stage or beat.facts_discovered)
+            if beat.progress_summary and progress_attempted:
                 summary = beat.progress_summary or f"{player.name} made progress on {quest.title}."
                 quest.discoveries.append(summary[:180])
                 del quest.discoveries[:-8]
@@ -628,7 +846,9 @@ class WorldEngine:
                     importance=9,
                     tags=["quest", quest.title, location.name if location else "frontier"],
                 )
-            if beat.complete_current_stage or quest.progress >= quest.progress_required:
+            elif delta:
+                quest.progress = min(quest.progress_required, quest.progress + delta)
+            if progress_attempted and self._quest_stage_satisfied(quest, world, player, location):
                 self._advance_quest_stage(world, quest, memory)
 
         for effect in beat.clock_effects:
@@ -637,6 +857,74 @@ class WorldEngine:
                 continue
             self._apply_clock_effect(world, effect)
         self._sync_active_quest_display(world)
+
+    def _quest_stage_satisfied(
+        self,
+        quest: Quest,
+        world: World,
+        player: Player,
+        location: Location | None,
+    ) -> bool:
+        conditions = (
+            quest.stage_conditions[quest.current_stage]
+            if quest.current_stage < len(quest.stage_conditions)
+            else []
+        )
+        if not conditions:
+            return quest.progress >= quest.progress_required
+        return all(self._condition_satisfied(condition, world, player, location) for condition in conditions)
+
+    def _condition_satisfied(
+        self,
+        condition: Condition,
+        world: World,
+        player: Player,
+        location: Location | None,
+    ) -> bool:
+        target = condition.target_id.casefold()
+        if condition.kind == ConditionKind.ITEM_ACQUIRED:
+            return any(item.casefold() == target for item in player.inventory)
+        if condition.kind == ConditionKind.NPC_RECRUITED:
+            npc = next(
+                (item for item in world.npcs if item.id.casefold() == target or item.name.casefold() == target),
+                None,
+            )
+            expected = (condition.expected or "recruited").casefold()
+            return npc is not None and npc.disposition.casefold() == expected
+        if condition.kind == ConditionKind.FACT_DISCOVERED:
+            return any(fact.casefold() == target for fact in world.discovered_facts)
+        if condition.kind == ConditionKind.TARGET_DEFEATED:
+            encounter = world.active_encounter
+            return (
+                encounter is not None
+                and encounter.id.casefold() == target
+                and encounter.status == EncounterStatus.RESOLVED
+            )
+        if condition.kind == ConditionKind.LOCATION_REACHED:
+            return location is not None and (
+                location.id.casefold() == target or location.name.casefold() == target
+            )
+        if condition.kind == ConditionKind.OBJECT_ACTIVATED:
+            expected = (condition.expected or "activated").casefold()
+            return any(
+                (
+                    key.casefold() == target
+                    or str(record.get("id", "")).casefold() == target
+                    or str(record.get("name", "")).casefold() == target
+                )
+                and str(record.get("status", "")).casefold() == expected
+                for key, record in world.object_states.items()
+            )
+        if condition.kind == ConditionKind.CHOICE_COMMITTED:
+            return any(choice.casefold() == target for choice in world.committed_choices)
+        if condition.kind == ConditionKind.CLOCK_THRESHOLD:
+            clock = next(
+                (item for item in world.clocks if item.id.casefold() == target or item.title.casefold() == target),
+                None,
+            )
+            threshold = condition.minimum if condition.minimum is not None else (clock.max_value if clock else 0)
+            return clock is not None and clock.value >= threshold
+        return False
 
     def _advance_quest_stage(self, world: World, quest: Quest, memory: CampaignMemory) -> None:
         quest.progress = 0
@@ -670,6 +958,44 @@ class WorldEngine:
         if clock.value >= clock.max_value:
             clock.status = "complete"
             self._add_event(world, "clock", f"{clock.title} reaches its breaking point: {reason_text}", severity="warning")
+            self._fire_clock_triggers(world, clock)
+
+    def _fire_clock_triggers(self, world: World, clock: QuestClock) -> None:
+        if clock.triggered:
+            return
+        for trigger in clock.triggers:
+            if trigger.fired:
+                continue
+            if trigger.kind == ClockTriggerKind.ADD_FACT:
+                fact = trigger.target_id or trigger.text or f"clock:{clock.id}:complete"
+                if fact not in world.discovered_facts:
+                    world.discovered_facts.append(fact)
+                self._remember_state_fact(world, trigger.text or f"{clock.title} completed.", world.tick)
+            elif trigger.kind == ClockTriggerKind.FAIL_QUEST:
+                quest = next((item for item in world.quests if item.id == trigger.target_id), None)
+                if quest is not None and quest.status == "active":
+                    quest.status = "failed"
+                    self._add_event(world, "quest", f"Quest failed: {quest.title}.", severity="warning")
+            elif trigger.kind == ClockTriggerKind.STABILITY_DELTA:
+                world.stability = max(0, min(100, world.stability + trigger.amount))
+                self._remember_state_fact(
+                    world,
+                    trigger.text or f"{clock.title} changed stability by {trigger.amount}.",
+                    world.tick,
+                )
+            elif trigger.kind == ClockTriggerKind.START_ENCOUNTER:
+                world.active_encounter = EncounterState(
+                    id=trigger.target_id or f"clock-encounter-{clock.id}",
+                    kind="clock_trigger",
+                    participants=[],
+                    objective=trigger.text or f"Survive the consequences of {clock.title}.",
+                    phase="opening",
+                    exits=["flee"],
+                )
+                world.current_activity = "combat"
+                world.movement_lock = "you are in a fight"
+            trigger.fired = True
+        clock.triggered = True
 
     def summary_counts(self, world: World) -> dict[str, int]:
         return {
@@ -683,7 +1009,9 @@ class WorldEngine:
         return list(world.scene_objects.get(self._position_key(position), []))
 
     def ensure_progression(self, world: World) -> None:
+        self._ensure_entity_ids(world)
         self._ensure_progression(world)
+        self._ensure_legacy_encounter(world)
 
     def _resolve_freeform_action(
         self,
@@ -703,11 +1031,21 @@ class WorldEngine:
         if unavailable is not None:
             return CommandResult(unavailable)
         beat = director.respond_to_freeform_action(world, player, action, location, npc, memory_context)
-        self._apply_beat_context(world, beat)
-        self._remember_scene_objects(world, player.position, beat.scene_objects)
-        visible_items = self.scene_objects_at(world, player.position)
-        added = self._apply_inventory_changes(player, world, action, beat, visible_items)
-        removed_scene_items = self._apply_scene_object_action(world, player.position, action, visible_items)
+        self._apply_beat_context(world, beat, player, location)
+        success: bool | None = None
+        suffix_parts: list[str] = []
+        if beat.mechanical_request is not None:
+            success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
+            suffix_parts.append(world.last_roll or "")
+
+        added: list[str] = []
+        removed_scene_items: list[str] = []
+        if success is not False:
+            self._remember_scene_objects(world, player.position, beat.scene_objects)
+            visible_items = self.scene_objects_at(world, player.position)
+            added = self._apply_inventory_changes(player, world, action, beat, visible_items)
+            removed_scene_items = self._apply_scene_object_action(world, player.position, action, visible_items)
+
         place = location.name if location else "the wilds"
         outcome_parts = [f"attempted `{action}`"]
         if beat.tags:
@@ -718,6 +1056,8 @@ class WorldEngine:
             outcome_parts.append(f"changed/removed: {', '.join(removed_scene_items)}")
         if beat.follow_up_hook:
             outcome_parts.append(f"hook: {beat.follow_up_hook}")
+        if success is False:
+            outcome_parts.append("authoritative effects rejected after failed check")
         self._remember_state_fact(world, f"{player.name} near {place}: {'; '.join(outcome_parts)}.", world.tick)
         memory.remember(
             "action",
@@ -727,21 +1067,26 @@ class WorldEngine:
             importance=6,
             tags=[player.name, place, "action"],
         )
-        suffix_parts = []
         if added:
             suffix_parts.append(f"Added to inventory: {', '.join(added)}.")
         if removed_scene_items:
             suffix_parts.append(f"Scene changed: {', '.join(removed_scene_items)}.")
-        success: bool | None = None
         if beat.mechanical_request is not None:
-            success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
-            suffix_parts.insert(0, world.last_roll or "")
             follow_up = self._roll_follow_up(action, success, beat, location, npc)
             world.current_choices = self._merge_choices(follow_up["choices"], beat.choices)
             suffix_parts.append(follow_up["prompt"])
-            if not success and beat.mechanical_request == "combat_check":
-                world.current_activity = "combat"
-                world.movement_lock = "you are in a fight"
+            if success and beat.mechanical_request == "combat_check":
+                self._resolve_active_encounter(world, EncounterStatus.RESOLVED, "The hostile encounter was overcome.")
+            elif success and beat.mechanical_request == "exploration_check":
+                encounter = world.active_encounter
+                if encounter is not None and encounter.movement_locked:
+                    self._resolve_active_encounter(
+                        world,
+                        EncounterStatus.ESCAPED,
+                        "A successful exploration action found a route out.",
+                    )
+            elif not success and beat.mechanical_request == "combat_check":
+                self._start_encounter(world, player, location, "Survive or overcome the hostile threat.")
         self._apply_progression(world, player, beat, memory, location, success)
         self._advance_world(world, player, director, memory, "freeform")
         memory.remember_world_state(world, player)
@@ -836,21 +1181,21 @@ class WorldEngine:
         verb, item = target
         if not item:
             return None
-        known_object = (
-            self._matches_known_object(item, visible_items)
-            or self._matches_known_object(item, inventory)
-            or self._object_state_for_target(world, position, item) is not None
-        )
+        visible_match = self._matches_known_object(item, visible_items)
+        inventory_match = self._matches_known_object(item, inventory)
+        state = self._object_state_for_target(world, position, item)
+        known_object = visible_match or inventory_match or state is not None
         if not known_object:
             return None
-        if verb in {"take", "get", "grab"} and self._matches_known_object(item, inventory):
+        if verb in {"take", "get", "grab"} and inventory_match:
             return f"You already have {item}."
-        state = self._object_state_for_target(world, position, item)
         if state is not None and state.get("status") in {"destroyed", "removed", "in_inventory"}:
             status = state.get("status")
             if status == "in_inventory":
                 return f"You already have {item}."
             return f"The {item} is already {status}."
+        if visible_match or inventory_match or state is not None:
+            return None
         return f"There is no {item} here to {verb}."
 
     def _object_state_for_target(self, world: World, position: Position, item: str) -> dict[str, object] | None:
@@ -1343,20 +1688,25 @@ class WorldEngine:
                 )
             )
         locations.sort(key=lambda item: (item.position.y, item.position.x))
-        return locations[:12]
+        locations = locations[:12]
+        for index, location in enumerate(locations):
+            location.id = f"location-{index + 1:03d}"
+        return locations
 
     def _generate_npcs(self, locations: list[Location]) -> list[Npc]:
         first_names = ["Mira", "Thane", "Ivo", "Sable", "Orrin", "Kael", "Brin", "Lysa"]
         roles = ["guide", "warden", "merchant", "scribe", "hunter", "priest"]
         moods = ["wary", "friendly", "guarded", "intense", "skeptical"]
         npcs: list[Npc] = []
-        for location in locations[:8]:
+        for index, location in enumerate(locations[:8]):
             npcs.append(
                 Npc(
                     name=self.random.choice(first_names),
                     role=self.random.choice(roles),
                     disposition=self.random.choice(moods),
                     location_name=location.name,
+                    id=f"npc-{index + 1:03d}",
+                    location_id=location.id,
                 )
             )
         return npcs

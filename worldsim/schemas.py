@@ -182,6 +182,24 @@ DIRECTOR_BEAT_SCHEMA: dict[str, object] = {
         "quest_progress_delta": {"type": "integer", "minimum": 0, "maximum": 2},
         "complete_current_stage": {"type": "boolean"},
         "facts_discovered": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
+        "npc_disposition_changes": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "required": ["npc_id", "disposition"],
+                "properties": {
+                    "npc_id": {"type": "string"},
+                    "disposition": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "choices_committed": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 4,
+        },
         "clock_effects": {
             "type": "array",
             "maxItems": 3,
@@ -244,6 +262,8 @@ ACTION_INTENT_SCHEMA: dict[str, object] = {
                                 EffectKind.SCENE_EXIT,
                                 EffectKind.SCENE_STEP,
                                 EffectKind.SCENE_TENSION,
+                                EffectKind.CAMPAIGN_VICTORY,
+                                EffectKind.CAMPAIGN_DEFEAT,
                             }
                         ],
                     },
@@ -282,6 +302,22 @@ def director_context(
             "tick": world.tick,
             "theme_prompt": world.theme_prompt,
             "campaign_title": world.campaign_title,
+            "campaign_status": world.campaign_status.value,
+            "main_quest_id": world.main_quest_id,
+            "finale": {
+                "title": world.finale_title,
+                "requirements": [
+                    {
+                        "kind": condition.kind.value,
+                        "target_id": condition.target_id,
+                        "expected": condition.expected,
+                        "minimum": condition.minimum,
+                    }
+                    for condition in world.finale_requirements
+                ],
+                "ending_reason": world.ending_reason,
+                "epilogue": world.epilogue,
+            },
             "overarching_quest": world.overarching_quest,
             "weather": world.weather,
             "stability": world.stability,
@@ -306,6 +342,7 @@ def director_context(
                     "role": npc.role,
                     "disposition": npc.disposition,
                     "location_name": npc.location_name,
+                    "location_id": npc.location_id,
                 }
                 for index, npc in enumerate(world.npcs)
             ],
@@ -330,6 +367,9 @@ def director_context(
             "active_scene": _scene_payload(world),
             "active_encounter": _encounter_payload(world),
             "dialogue_state": _dialogue_payload(world),
+            "resolved_encounter_ids": list(world.resolved_encounter_ids[-20:]),
+            "discovered_facts": list(world.discovered_facts[-20:]),
+            "committed_choices": list(world.committed_choices[-20:]),
         },
         "player": _player_payload(player) if player is not None else None,
         "location": _location_payload(location) if location is not None else None,
@@ -514,6 +554,10 @@ def director_beat_from_payload(payload: dict[str, object]) -> DirectorBeat:
         complete_current_stage=bool(payload.get("complete_current_stage", False)),
         clock_effects=_clock_effects(payload.get("clock_effects")),
         facts_discovered=_string_list(payload.get("facts_discovered"), 6),
+        npc_disposition_changes=_npc_disposition_changes(
+            payload.get("npc_disposition_changes")
+        ),
+        choices_committed=_string_list(payload.get("choices_committed"), 4),
     )
 
 
@@ -664,23 +708,36 @@ def _npc_payload(npc: Npc) -> dict[str, object]:
         "role": npc.role,
         "disposition": npc.disposition,
         "location_name": npc.location_name,
+        "location_id": npc.location_id,
     }
 
 
 def _quest_payload(quest: Quest) -> dict[str, object]:
-    stage = quest.stages[min(quest.current_stage, len(quest.stages) - 1)] if quest.stages else quest.goal
+    stage = (
+        quest.stages[min(quest.current_stage, len(quest.stages) - 1)]
+        if quest.stages
+        else None
+    )
     return {
         "id": quest.id,
         "title": quest.title,
         "goal": quest.goal,
-        "status": quest.status,
+        "status": quest.status.value,
         "current_stage_index": quest.current_stage,
-        "current_stage": stage,
-        "progress": quest.progress,
-        "progress_required": quest.progress_required,
+        "current_stage": {
+            "id": stage.id,
+            "title": stage.title,
+            "description": stage.description,
+            "status": stage.status.value,
+        }
+        if stage is not None
+        else None,
         "discoveries": _compact_lines(quest.discoveries[-5:], 180),
         "related_locations": list(quest.related_locations),
         "related_npcs": list(quest.related_npcs),
+        "prerequisite_quest_ids": list(quest.prerequisite_quest_ids),
+        "required_for_finale": quest.required_for_finale,
+        "failure_reason": quest.failure_reason,
         "stage_conditions": [
             {
                 "kind": condition.kind.value,
@@ -689,8 +746,8 @@ def _quest_payload(quest: Quest) -> dict[str, object]:
                 "minimum": condition.minimum,
             }
             for condition in (
-                quest.stage_conditions[quest.current_stage]
-                if quest.current_stage < len(quest.stage_conditions)
+                stage.conditions
+                if stage is not None
                 else []
             )
         ],
@@ -704,7 +761,7 @@ def _clock_payload(clock: QuestClock) -> dict[str, object]:
         "value": clock.value,
         "max_value": clock.max_value,
         "description": clock.description,
-        "status": clock.status,
+        "status": clock.status.value,
         "triggered": clock.triggered,
         "triggers": [
             {
@@ -865,6 +922,28 @@ def _clock_effects(value: object) -> list[dict[str, object]]:
             }
         )
     return effects[:3]
+
+
+def _npc_disposition_changes(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    changes: list[dict[str, str]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        npc_id = raw.get("npc_id")
+        disposition = raw.get("disposition")
+        if not isinstance(npc_id, str) or not npc_id.strip():
+            continue
+        if not isinstance(disposition, str) or not disposition.strip():
+            continue
+        changes.append(
+            {
+                "npc_id": npc_id.strip()[:60],
+                "disposition": disposition.strip()[:60],
+            }
+        )
+    return changes[:4]
 
 
 def _compact_lines(lines: list[str], max_length: int) -> list[str]:

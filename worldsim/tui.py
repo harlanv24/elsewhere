@@ -1189,6 +1189,7 @@ class WorldSimApp(App[None]):
             "\n".join(
                 [
                 f"Campaign: {world.campaign_title}",
+                f"Status: {world.campaign_status.value}",
                 f"World Age: {world.tick} turns",
                 f"Map Size: {world.width} x {world.height}",
                 f"Locations: {counts['locations']}",
@@ -1515,6 +1516,7 @@ class WorldSimApp(App[None]):
             f"Theme: {world.theme_prompt}",
             "",
             f"Campaign Quest: {world.overarching_quest}",
+            f"Campaign Status: {world.campaign_status.value}",
             "",
             f"Current Objective: {world.active_quest or 'None selected'}",
             "",
@@ -1524,8 +1526,8 @@ class WorldSimApp(App[None]):
             lines.extend(
                 [
                     f"Quest: {active.title}",
-                    f"Stage: {stage}",
-                    f"Progress: {active.progress}/{active.progress_required}",
+                    f"Quest Status: {active.status.value}",
+                    f"Stage: {stage.description if hasattr(stage, 'description') else stage}",
                     "",
                 ]
             )
@@ -1540,6 +1542,8 @@ class WorldSimApp(App[None]):
             lines.append("")
         lines.append("Loose Threads:")
         lines.extend(world.quest_hooks[:5])
+        if world.epilogue:
+            lines.extend(["", "Epilogue:", world.epilogue])
         return self._wrap_paragraphs("\n\n".join(line for line in lines if line) or "No active hooks.", 34)
 
     def _areas_text(self, location: Location | None) -> str:
@@ -1681,7 +1685,11 @@ class WorldSimApp(App[None]):
             text.append_text(self._thinking_text(include_context=True))
         text.append("\n")
         text.append(world.campaign_title, style="bold #f9fafb")
-        text.append(f"  |  Tick {world.tick:,}  |  Stability {world.stability}%", style="#cbd5e1")
+        text.append(
+            f"  |  {world.campaign_status.value.upper()}  |  "
+            f"Tick {world.tick:,}  |  Stability {world.stability}%",
+            style="#cbd5e1",
+        )
         return text
 
     def _usage_summary(self, world: World) -> str:

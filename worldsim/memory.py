@@ -10,8 +10,10 @@ from worldsim.models import (
     ActionIntent,
     ActionKind,
     Biome,
+    CampaignStatus,
     CheckKind,
     CheckResult,
+    ClockStatus,
     ClockTrigger,
     ClockTriggerKind,
     Condition,
@@ -29,6 +31,9 @@ from worldsim.models import (
     Position,
     Quest,
     QuestClock,
+    QuestStage,
+    QuestStageStatus,
+    QuestStatus,
     RejectedEffect,
     SceneMode,
     SceneState,
@@ -41,7 +46,7 @@ from worldsim.schemas import turn_record_to_payload
 from worldsim.usage import UsageTotals
 
 
-SAVE_SCHEMA_VERSION = 3
+SAVE_SCHEMA_VERSION = 4
 
 
 class UnsupportedSaveVersion(ValueError):
@@ -241,6 +246,15 @@ class CampaignStore:
             "stability": world.stability,
             "theme_prompt": world.theme_prompt,
             "campaign_title": world.campaign_title,
+            "campaign_status": world.campaign_status.value,
+            "main_quest_id": world.main_quest_id,
+            "finale_requirements": [
+                self._serialize_condition(condition)
+                for condition in world.finale_requirements
+            ],
+            "finale_title": world.finale_title,
+            "epilogue": world.epilogue,
+            "ending_reason": world.ending_reason,
             "overarching_quest": world.overarching_quest,
             "active_quest": world.active_quest,
             "active_quest_id": world.active_quest_id,
@@ -264,6 +278,7 @@ class CampaignStore:
             "dialogue_state": asdict(world.dialogue_state) if world.dialogue_state is not None else None,
             "discovered_facts": list(world.discovered_facts),
             "committed_choices": list(world.committed_choices),
+            "resolved_encounter_ids": list(world.resolved_encounter_ids),
             "turn_records": [turn_record_to_payload(record) for record in world.turn_records],
         }
 
@@ -282,6 +297,12 @@ class CampaignStore:
         ]
         npcs = [Npc(**npc) for npc in payload["npcs"]]
         recent_events = [Event(**event) for event in payload["recent_events"]]
+        try:
+            campaign_status = CampaignStatus(
+                str(payload.get("campaign_status", CampaignStatus.ACTIVE.value))
+            )
+        except ValueError:
+            campaign_status = CampaignStatus.ACTIVE
         return World(
             seed=payload["seed"],
             tick=payload["tick"],
@@ -313,6 +334,20 @@ class CampaignStore:
             stability=payload["stability"],
             theme_prompt=payload.get("theme_prompt", "character-driven adventure"),
             campaign_title=payload.get("campaign_title", "Untitled Frontier"),
+            campaign_status=campaign_status,
+            main_quest_id=payload.get("main_quest_id")
+            if isinstance(payload.get("main_quest_id"), str)
+            else None,
+            finale_requirements=self._deserialize_conditions(
+                payload.get("finale_requirements", [])
+            ),
+            finale_title=str(payload.get("finale_title", "The Final Reckoning")),
+            epilogue=payload.get("epilogue")
+            if isinstance(payload.get("epilogue"), str)
+            else None,
+            ending_reason=payload.get("ending_reason")
+            if isinstance(payload.get("ending_reason"), str)
+            else None,
             overarching_quest=payload.get("overarching_quest", "Uncover the central threat shaping the frontier."),
             active_quest=payload.get("active_quest"),
             active_quest_id=payload.get("active_quest_id"),
@@ -336,6 +371,7 @@ class CampaignStore:
             dialogue_state=self._deserialize_dialogue(payload.get("dialogue_state")),
             discovered_facts=list(payload.get("discovered_facts", [])),
             committed_choices=list(payload.get("committed_choices", [])),
+            resolved_encounter_ids=list(payload.get("resolved_encounter_ids", [])),
             turn_records=[
                 record
                 for item in payload.get("turn_records", [])
@@ -351,6 +387,15 @@ class CampaignStore:
             "tick": world.tick,
             "theme_prompt": world.theme_prompt,
             "campaign_title": world.campaign_title,
+            "campaign_status": world.campaign_status.value,
+            "main_quest_id": world.main_quest_id,
+            "finale_requirements": [
+                self._serialize_condition(condition)
+                for condition in world.finale_requirements
+            ],
+            "finale_title": world.finale_title,
+            "epilogue": world.epilogue,
+            "ending_reason": world.ending_reason,
             "overarching_quest": world.overarching_quest,
             "active_quest": world.active_quest,
             "active_quest_id": world.active_quest_id,
@@ -379,6 +424,7 @@ class CampaignStore:
             "active_scene": self._serialize_scene(world.active_scene),
             "active_encounter": self._serialize_encounter(world.active_encounter),
             "dialogue_state": asdict(world.dialogue_state) if world.dialogue_state is not None else None,
+            "resolved_encounter_ids": list(world.resolved_encounter_ids),
             "turn_records": [turn_record_to_payload(record) for record in world.turn_records[-12:]],
         }
 
@@ -399,6 +445,9 @@ class CampaignStore:
         if version == 2:
             payload = self._migrate_v2_to_v3(payload)
             version = 3
+        if version == 3:
+            payload = self._migrate_v3_to_v4(payload)
+            version = 4
         if version != SAVE_SCHEMA_VERSION:
             raise UnsupportedSaveVersion(f"No migration path from campaign save version {version}.")
         return payload
@@ -515,65 +564,248 @@ class CampaignStore:
         payload["schema_version"] = 3
         return payload
 
-    def _serialize_quest(self, quest: Quest) -> dict[str, object]:
-        payload = asdict(quest)
-        payload["stage_conditions"] = [
+    def _migrate_v3_to_v4(self, payload: dict[str, object]) -> dict[str, object]:
+        world = payload.get("world")
+        if not isinstance(world, dict):
+            raise ValueError("Version 3 campaign save must contain a world object.")
+
+        locations = {
+            str(item.get("name", "")).casefold(): str(item.get("id", ""))
+            for item in world.get("locations", [])
+            if isinstance(item, dict)
+        }
+        npcs = {
+            str(item.get("name", "")).casefold(): str(item.get("id", ""))
+            for item in world.get("npcs", [])
+            if isinstance(item, dict)
+        }
+        quests = [
+            item for item in world.get("quests", []) if isinstance(item, dict)
+        ]
+        for quest_index, quest in enumerate(quests):
+            quest_id = str(quest.get("id", f"quest-{quest_index + 1}"))
+            raw_conditions = quest.pop("stage_conditions", [])
+            typed_stages: list[dict[str, object]] = []
+            raw_stages = quest.get("stages", [])
+            if not isinstance(raw_stages, list):
+                raw_stages = []
+            current_stage = int(quest.get("current_stage", 0))
+            quest_status = str(quest.get("status", QuestStatus.ACTIVE.value))
+            for stage_index, raw_stage in enumerate(raw_stages):
+                if isinstance(raw_stage, dict):
+                    typed_stages.append(raw_stage)
+                    continue
+                description = " ".join(str(raw_stage).split()) or f"Stage {stage_index + 1}"
+                conditions = (
+                    raw_conditions[stage_index]
+                    if isinstance(raw_conditions, list)
+                    and stage_index < len(raw_conditions)
+                    and isinstance(raw_conditions[stage_index], list)
+                    else []
+                )
+                if not conditions:
+                    related_locations = quest.get("related_locations", [])
+                    related_npcs = quest.get("related_npcs", [])
+                    if stage_index == 0 and isinstance(related_locations, list) and related_locations:
+                        target = str(related_locations[0])
+                        conditions = [
+                            {
+                                "kind": ConditionKind.LOCATION_REACHED.value,
+                                "target_id": locations.get(target.casefold(), target),
+                                "expected": None,
+                                "minimum": None,
+                            }
+                        ]
+                    elif stage_index == 1 and isinstance(related_npcs, list) and related_npcs:
+                        target = str(related_npcs[0])
+                        conditions = [
+                            {
+                                "kind": ConditionKind.NPC_RECRUITED.value,
+                                "target_id": npcs.get(target.casefold(), target),
+                                "expected": "allied",
+                                "minimum": None,
+                            }
+                        ]
+                    else:
+                        conditions = [
+                            {
+                                "kind": ConditionKind.FACT_DISCOVERED.value,
+                                "target_id": f"quest:{quest_id}:stage:{stage_index + 1}",
+                                "expected": None,
+                                "minimum": None,
+                            }
+                        ]
+                if quest_status == QuestStatus.COMPLETE.value or stage_index < current_stage:
+                    stage_status = QuestStageStatus.COMPLETE.value
+                elif quest_status == QuestStatus.FAILED.value and stage_index == current_stage:
+                    stage_status = QuestStageStatus.FAILED.value
+                elif quest_status == QuestStatus.ACTIVE.value and stage_index == current_stage:
+                    stage_status = QuestStageStatus.ACTIVE.value
+                else:
+                    stage_status = QuestStageStatus.LOCKED.value
+                typed_stages.append(
+                    {
+                        "id": f"{quest_id}:stage:{stage_index + 1}",
+                        "title": description,
+                        "description": description,
+                        "conditions": conditions,
+                        "status": stage_status,
+                    }
+                )
+            quest["stages"] = typed_stages
+            quest["stage_conditions"] = [
+                stage.get("conditions", []) for stage in typed_stages
+            ]
+            quest.setdefault(
+                "prerequisite_quest_ids",
+                [str(quests[quest_index - 1].get("id"))] if quest_index else [],
+            )
+            quest.setdefault("required_for_finale", True)
+            quest.setdefault("failure_reason", None)
+            if quest_index and quest_status == QuestStatus.ACTIVE.value:
+                quest["status"] = QuestStatus.LOCKED.value
+
+        main_quest_id = (
+            str(quests[-1].get("id"))
+            if quests
+            else world.get("active_quest_id")
+        )
+        world.setdefault("campaign_status", CampaignStatus.ACTIVE.value)
+        world.setdefault("main_quest_id", main_quest_id)
+        world.setdefault(
+            "finale_requirements",
             [
                 {
-                    "kind": condition.kind.value,
-                    "target_id": condition.target_id,
-                    "expected": condition.expected,
-                    "minimum": condition.minimum,
+                    "kind": ConditionKind.QUEST_COMPLETED.value,
+                    "target_id": main_quest_id,
+                    "expected": None,
+                    "minimum": None,
                 }
-                for condition in stage
             ]
-            for stage in quest.stage_conditions
-        ]
+            if isinstance(main_quest_id, str)
+            else [],
+        )
+        world.setdefault("finale_title", "The Final Reckoning")
+        world.setdefault("epilogue", None)
+        world.setdefault("ending_reason", None)
+        resolved = []
+        encounter = world.get("active_encounter")
+        if (
+            isinstance(encounter, dict)
+            and encounter.get("status") == EncounterStatus.RESOLVED.value
+            and isinstance(encounter.get("id"), str)
+        ):
+            resolved.append(encounter["id"])
+        world.setdefault("resolved_encounter_ids", resolved)
+        payload["schema_version"] = 4
         return payload
+
+    def _serialize_quest(self, quest: Quest) -> dict[str, object]:
+        typed_stages = [
+            stage for stage in quest.stages if isinstance(stage, QuestStage)
+        ]
+        return {
+            "id": quest.id,
+            "title": quest.title,
+            "goal": quest.goal,
+            "stages": [
+                {
+                    "id": stage.id,
+                    "title": stage.title,
+                    "description": stage.description,
+                    "conditions": [
+                        self._serialize_condition(condition)
+                        for condition in stage.conditions
+                    ],
+                    "status": stage.status.value,
+                }
+                for stage in typed_stages
+            ],
+            "current_stage": quest.current_stage,
+            "progress": quest.progress,
+            "progress_required": quest.progress_required,
+            "status": quest.status.value,
+            "related_locations": list(quest.related_locations),
+            "related_npcs": list(quest.related_npcs),
+            "discoveries": list(quest.discoveries),
+            "stage_conditions": [
+                [
+                    self._serialize_condition(condition)
+                    for condition in stage.conditions
+                ]
+                for stage in typed_stages
+            ],
+            "prerequisite_quest_ids": list(quest.prerequisite_quest_ids),
+            "required_for_finale": quest.required_for_finale,
+            "failure_reason": quest.failure_reason,
+        }
 
     def _deserialize_quest(self, payload: dict[str, object]) -> Quest:
         raw = dict(payload)
-        stages: list[list[Condition]] = []
-        for raw_stage in raw.pop("stage_conditions", []):
-            conditions: list[Condition] = []
-            if isinstance(raw_stage, list):
-                for item in raw_stage:
-                    if not isinstance(item, dict):
-                        continue
-                    try:
-                        kind = ConditionKind(str(item.get("kind")))
-                    except ValueError:
-                        continue
-                    target_id = item.get("target_id")
-                    if not isinstance(target_id, str) or not target_id:
-                        continue
-                    expected = item.get("expected")
-                    minimum = item.get("minimum")
-                    conditions.append(
-                        Condition(
-                            kind=kind,
-                            target_id=target_id,
-                            expected=expected if isinstance(expected, str) else None,
-                            minimum=minimum if isinstance(minimum, int) and not isinstance(minimum, bool) else None,
-                        )
-                    )
-            stages.append(conditions)
-        return Quest(**raw, stage_conditions=stages)
+        legacy_conditions = [
+            self._deserialize_conditions(item)
+            for item in raw.pop("stage_conditions", [])
+            if isinstance(item, list)
+        ]
+        stages: list[QuestStage | str] = []
+        for index, item in enumerate(raw.pop("stages", [])):
+            if isinstance(item, str):
+                stages.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            try:
+                status = QuestStageStatus(
+                    str(item.get("status", QuestStageStatus.LOCKED.value))
+                )
+            except ValueError:
+                status = QuestStageStatus.LOCKED
+            conditions = self._deserialize_conditions(item.get("conditions", []))
+            if not conditions and index < len(legacy_conditions):
+                conditions = legacy_conditions[index]
+            stages.append(
+                QuestStage(
+                    id=str(item.get("id", f"{raw.get('id', 'quest')}:stage:{index + 1}")),
+                    title=str(item.get("title", f"Stage {index + 1}")),
+                    description=str(
+                        item.get("description", item.get("title", f"Stage {index + 1}"))
+                    ),
+                    conditions=conditions,
+                    status=status,
+                )
+            )
+        try:
+            status = QuestStatus(str(raw.pop("status", QuestStatus.ACTIVE.value)))
+        except ValueError:
+            status = QuestStatus.ACTIVE
+        return Quest(
+            **raw,
+            stages=stages,
+            stage_conditions=legacy_conditions,
+            status=status,
+        )
 
     def _serialize_clock(self, clock: QuestClock) -> dict[str, object]:
-        payload = asdict(clock)
-        payload["triggers"] = [
-            {
-                "id": trigger.id,
-                "kind": trigger.kind.value,
-                "target_id": trigger.target_id,
-                "amount": trigger.amount,
-                "text": trigger.text,
-                "fired": trigger.fired,
-            }
-            for trigger in clock.triggers
-        ]
-        return payload
+        return {
+            "id": clock.id,
+            "title": clock.title,
+            "value": clock.value,
+            "max_value": clock.max_value,
+            "description": clock.description,
+            "status": clock.status.value,
+            "triggers": [
+                {
+                    "id": trigger.id,
+                    "kind": trigger.kind.value,
+                    "target_id": trigger.target_id,
+                    "amount": trigger.amount,
+                    "text": trigger.text,
+                    "fired": trigger.fired,
+                }
+                for trigger in clock.triggers
+            ],
+            "triggered": clock.triggered,
+        }
 
     def _deserialize_clock(self, payload: dict[str, object]) -> QuestClock:
         raw = dict(payload)
@@ -598,7 +830,47 @@ class CampaignStore:
                     fired=bool(item.get("fired", False)),
                 )
             )
-        return QuestClock(**raw, triggers=triggers)
+        try:
+            status = ClockStatus(str(raw.pop("status", ClockStatus.ACTIVE.value)))
+        except ValueError:
+            status = ClockStatus.ACTIVE
+        return QuestClock(**raw, triggers=triggers, status=status)
+
+    def _serialize_condition(self, condition: Condition) -> dict[str, object]:
+        return {
+            "kind": condition.kind.value,
+            "target_id": condition.target_id,
+            "expected": condition.expected,
+            "minimum": condition.minimum,
+        }
+
+    def _deserialize_conditions(self, payload: object) -> list[Condition]:
+        if not isinstance(payload, list):
+            return []
+        conditions: list[Condition] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                kind = ConditionKind(str(item.get("kind")))
+            except ValueError:
+                continue
+            target_id = item.get("target_id")
+            if not isinstance(target_id, str) or not target_id:
+                continue
+            expected = item.get("expected")
+            minimum = item.get("minimum")
+            conditions.append(
+                Condition(
+                    kind=kind,
+                    target_id=target_id,
+                    expected=expected if isinstance(expected, str) else None,
+                    minimum=minimum
+                    if isinstance(minimum, int) and not isinstance(minimum, bool)
+                    else None,
+                )
+            )
+        return conditions
 
     def _deserialize_turn_record(self, payload: dict[str, object]) -> TurnRecord | None:
         raw_intent = payload.get("intent")

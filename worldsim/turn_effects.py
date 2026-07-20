@@ -7,6 +7,7 @@ from worldsim.models import (
     ActionIntent,
     CheckKind,
     CheckResult,
+    ConditionKind,
     DirectorBeat,
     EffectCondition,
     EffectKind,
@@ -98,6 +99,8 @@ class TurnEffectService:
                 unique.append(effect)
         priority = {
             EffectKind.FACT_DISCOVERED: 0,
+            EffectKind.NPC_DISPOSITION: 0,
+            EffectKind.CHOICE_COMMIT: 0,
             EffectKind.QUEST_PROGRESS: 1,
         }
         return sorted(unique, key=lambda effect: priority.get(effect.kind, 0))
@@ -134,6 +137,11 @@ class TurnEffectService:
             EffectKind.SCENE_TENSION,
         }:
             return "scene lifecycle effects are engine-owned"
+        if effect.kind in {
+            EffectKind.CAMPAIGN_VICTORY,
+            EffectKind.CAMPAIGN_DEFEAT,
+        }:
+            return self.engine.progression.validate_effect(effect, world, player)
         if (
             any(item.kind == EffectKind.LOCATION_TRANSITION for item in intent.proposed_effects)
             and effect.kind
@@ -202,6 +210,24 @@ class TurnEffectService:
         elif effect.kind == EffectKind.FACT_DISCOVERED:
             if not effect.target_id and not effect.value:
                 return "fact is empty"
+        elif effect.kind == EffectKind.NPC_DISPOSITION:
+            npc = next((item for item in world.npcs if item.id == effect.target_id), None)
+            if npc is None or not effect.value:
+                return "NPC disposition requires an exact NPC ID and value"
+            if not self.engine.progression.condition_target_is_active(
+                world,
+                ConditionKind.NPC_RECRUITED,
+                npc.id,
+                effect.value,
+            ):
+                return "NPC disposition does not satisfy the active quest stage"
+        elif effect.kind == EffectKind.CHOICE_COMMIT:
+            if not effect.target_id or not self.engine.progression.condition_target_is_active(
+                world,
+                ConditionKind.CHOICE_COMMITTED,
+                effect.target_id,
+            ):
+                return "choice does not match the active quest stage"
         elif effect.kind == EffectKind.QUEST_PROGRESS:
             quest = self.engine._active_quest(world)
             if quest is None or (effect.target_id and effect.target_id != quest.id):
@@ -282,10 +308,17 @@ class TurnEffectService:
                 memory.remember_hook(hook, world.tick)
         elif effect.kind == EffectKind.FACT_DISCOVERED:
             fact = effect.target_id or effect.value or ""
-            if fact and fact not in world.discovered_facts:
-                world.discovered_facts.append(fact)
-                del world.discovered_facts[:-80]
-                self.engine._remember_state_fact(world, f"Fact discovered: {fact}", world.tick)
+            self.engine.progression.add_fact(world, fact)
+        elif effect.kind == EffectKind.NPC_DISPOSITION:
+            npc = next(item for item in world.npcs if item.id == effect.target_id)
+            npc.disposition = effect.value or npc.disposition
+            self.engine._remember_state_fact(
+                world,
+                f"NPC disposition changed: {npc.id} is now {npc.disposition}.",
+                world.tick,
+            )
+        elif effect.kind == EffectKind.CHOICE_COMMIT:
+            self.engine.progression.commit_choice(world, effect.target_id or "")
         elif effect.kind == EffectKind.QUEST_PROGRESS:
             beat = DirectorBeat(
                 title=intent.title,
@@ -297,13 +330,15 @@ class TurnEffectService:
             )
             self.engine._apply_progression(world, player, beat, memory, location, True)
         elif effect.kind == EffectKind.CLOCK_DELTA:
-            self.engine._apply_clock_effect(
+            self.engine.progression.apply_clock_effect(
                 world,
                 {
                     "clock_id": effect.target_id,
                     "delta": effect.amount,
                     "reason": effect.value or "pressure changed",
                 },
+                player,
+                memory,
             )
         elif effect.kind == EffectKind.ENCOUNTER_RESOLVE:
             self.engine._resolve_active_encounter(
@@ -326,6 +361,11 @@ class TurnEffectService:
             player.position = destination.position
             world.dialogue_state = None
             self.engine.scene_service.sync(world, player, destination)
+        elif effect.kind in {
+            EffectKind.CAMPAIGN_VICTORY,
+            EffectKind.CAMPAIGN_DEFEAT,
+        }:
+            self.engine.progression.commit_effect(effect, world, player, memory)
 
     def summarize(
         self,

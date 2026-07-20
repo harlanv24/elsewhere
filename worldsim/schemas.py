@@ -166,6 +166,7 @@ DIRECTOR_BEAT_SCHEMA: dict[str, object] = {
         "progress_summary": {"type": ["string", "null"]},
         "quest_progress_delta": {"type": "integer", "minimum": 0, "maximum": 2},
         "complete_current_stage": {"type": "boolean"},
+        "facts_discovered": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
         "clock_effects": {
             "type": "array",
             "maxItems": 3,
@@ -245,6 +246,9 @@ def director_context(
             "movement_lock": world.movement_lock,
             "current_choices": world.current_choices,
             "last_roll": world.last_roll,
+            "active_scene": _scene_payload(world),
+            "active_encounter": _encounter_payload(world),
+            "dialogue_state": _dialogue_payload(world),
         },
         "player": _player_payload(player) if player is not None else None,
         "location": _location_payload(location) if location is not None else None,
@@ -427,6 +431,7 @@ def director_beat_from_payload(payload: dict[str, object]) -> DirectorBeat:
         quest_progress_delta=_bounded_int(payload.get("quest_progress_delta"), 0, 2, default=0),
         complete_current_stage=bool(payload.get("complete_current_stage", False)),
         clock_effects=_clock_effects(payload.get("clock_effects")),
+        facts_discovered=_string_list(payload.get("facts_discovered"), 6),
     )
 
 
@@ -492,6 +497,19 @@ def _quest_payload(quest: Quest) -> dict[str, object]:
         "discoveries": _compact_lines(quest.discoveries[-5:], 180),
         "related_locations": list(quest.related_locations),
         "related_npcs": list(quest.related_npcs),
+        "stage_conditions": [
+            {
+                "kind": condition.kind.value,
+                "target_id": condition.target_id,
+                "expected": condition.expected,
+                "minimum": condition.minimum,
+            }
+            for condition in (
+                quest.stage_conditions[quest.current_stage]
+                if quest.current_stage < len(quest.stage_conditions)
+                else []
+            )
+        ],
     }
 
 
@@ -503,6 +521,65 @@ def _clock_payload(clock: QuestClock) -> dict[str, object]:
         "max_value": clock.max_value,
         "description": clock.description,
         "status": clock.status,
+        "triggered": clock.triggered,
+        "triggers": [
+            {
+                "id": trigger.id,
+                "kind": trigger.kind.value,
+                "target_id": trigger.target_id,
+                "amount": trigger.amount,
+                "text": trigger.text,
+                "fired": trigger.fired,
+            }
+            for trigger in clock.triggers
+        ],
+    }
+
+
+def _scene_payload(world: World) -> dict[str, object] | None:
+    scene = world.active_scene
+    if scene is None:
+        return None
+    return {
+        "id": scene.id,
+        "location_id": scene.location_id,
+        "area_name": scene.area_name,
+        "step": scene.step,
+        "tension": scene.tension,
+        "theme": scene.theme,
+        "hazard": scene.hazard,
+        "local_npc_id": scene.local_npc_id,
+        "exit_open": scene.exit_open,
+        "available_actions": list(scene.available_actions),
+    }
+
+
+def _encounter_payload(world: World) -> dict[str, object] | None:
+    encounter = world.active_encounter
+    if encounter is None:
+        return None
+    return {
+        "id": encounter.id,
+        "kind": encounter.kind,
+        "participants": list(encounter.participants),
+        "objective": encounter.objective,
+        "phase": encounter.phase,
+        "obstacles": list(encounter.obstacles),
+        "exits": list(encounter.exits),
+        "status": encounter.status.value,
+        "resolution": encounter.resolution,
+    }
+
+
+def _dialogue_payload(world: World) -> dict[str, object] | None:
+    dialogue = world.dialogue_state
+    if dialogue is None:
+        return None
+    return {
+        "npc_id": dialogue.npc_id,
+        "npc_name": dialogue.npc_name,
+        "started_tick": dialogue.started_tick,
+        "active": dialogue.active,
     }
 
 

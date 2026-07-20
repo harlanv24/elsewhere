@@ -1,11 +1,38 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from worldsim.models import Biome, Event, Location, Npc, Player, Position, Quest, QuestClock, World
+from worldsim.models import (
+    Biome,
+    ClockTrigger,
+    ClockTriggerKind,
+    Condition,
+    ConditionKind,
+    DialogueState,
+    EncounterState,
+    EncounterStatus,
+    Event,
+    Location,
+    Npc,
+    Player,
+    Position,
+    Quest,
+    QuestClock,
+    SceneState,
+    World,
+)
 from worldsim.usage import UsageTotals
+
+
+SAVE_SCHEMA_VERSION = 1
+
+
+class UnsupportedSaveVersion(ValueError):
+    pass
 
 
 @dataclass
@@ -149,7 +176,10 @@ class CampaignStore:
     def load(self) -> tuple[World, Player, CampaignMemory] | None:
         if not self.path.exists():
             return None
-        payload = json.loads(self.path.read_text())
+        raw_payload = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(raw_payload, dict):
+            raise ValueError("Campaign save root must be a JSON object.")
+        payload = self._migrate_payload(raw_payload)
         world = self._deserialize_world(payload["world"])
         player = self._deserialize_player(payload["player"])
         memory = CampaignMemory.from_dict(payload.get("memory", {}))
@@ -158,12 +188,15 @@ class CampaignStore:
     def save(self, world: World, player: Player, memory: CampaignMemory) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "schema_version": SAVE_SCHEMA_VERSION,
             "world": self._serialize_world(world),
             "player": self._serialize_player(player),
             "memory": memory.to_dict(),
         }
-        self.path.write_text(json.dumps(payload, indent=2))
-        self.state_path.write_text(json.dumps(self._serialize_state(world, player, memory), indent=2))
+        self._write_json_atomic(self.path, payload)
+        state = self._serialize_state(world, player, memory)
+        state["schema_version"] = SAVE_SCHEMA_VERSION
+        self._write_json_atomic(self.state_path, state)
 
     def _serialize_world(self, world: World) -> dict[str, object]:
         return {
@@ -174,6 +207,7 @@ class CampaignStore:
             "tiles": [[tile.value for tile in row] for row in world.tiles],
             "locations": [
                 {
+                    "id": location.id,
                     "name": location.name,
                     "position": {"x": location.position.x, "y": location.position.y},
                     "biome": location.biome.value,
@@ -197,8 +231,8 @@ class CampaignStore:
             "overarching_quest": world.overarching_quest,
             "active_quest": world.active_quest,
             "active_quest_id": world.active_quest_id,
-            "quests": [asdict(quest) for quest in world.quests],
-            "clocks": [asdict(clock) for clock in world.clocks],
+            "quests": [self._serialize_quest(quest) for quest in world.quests],
+            "clocks": [self._serialize_clock(clock) for clock in world.clocks],
             "usage_totals": world.usage_totals.to_dict(),
             "current_choices": list(world.current_choices),
             "current_activity": world.current_activity,
@@ -212,6 +246,11 @@ class CampaignStore:
             "inventory_descriptions": dict(world.inventory_descriptions),
             "skill_descriptions": dict(world.skill_descriptions),
             "homeland_descriptions": dict(world.homeland_descriptions),
+            "active_scene": self._serialize_scene(world.active_scene),
+            "active_encounter": self._serialize_encounter(world.active_encounter),
+            "dialogue_state": asdict(world.dialogue_state) if world.dialogue_state is not None else None,
+            "discovered_facts": list(world.discovered_facts),
+            "committed_choices": list(world.committed_choices),
         }
 
     def _deserialize_world(self, payload: dict[str, object]) -> World:
@@ -223,6 +262,7 @@ class CampaignStore:
                 biome=Biome(location["biome"]),
                 danger=location["danger"],
                 summary=location["summary"],
+                id=str(location.get("id", "")),
             )
             for location in payload["locations"]
         ]
@@ -262,8 +302,8 @@ class CampaignStore:
             overarching_quest=payload.get("overarching_quest", "Uncover the central threat shaping the frontier."),
             active_quest=payload.get("active_quest"),
             active_quest_id=payload.get("active_quest_id"),
-            quests=[Quest(**quest) for quest in payload.get("quests", []) if isinstance(quest, dict)],
-            clocks=[QuestClock(**clock) for clock in payload.get("clocks", []) if isinstance(clock, dict)],
+            quests=[self._deserialize_quest(quest) for quest in payload.get("quests", []) if isinstance(quest, dict)],
+            clocks=[self._deserialize_clock(clock) for clock in payload.get("clocks", []) if isinstance(clock, dict)],
             usage_totals=UsageTotals.from_dict(payload.get("usage_totals")),
             current_choices=list(payload.get("current_choices", [])),
             current_activity=payload.get("current_activity"),
@@ -277,6 +317,11 @@ class CampaignStore:
             inventory_descriptions=dict(payload.get("inventory_descriptions", {})),
             skill_descriptions=dict(payload.get("skill_descriptions", {})),
             homeland_descriptions=dict(payload.get("homeland_descriptions", {})),
+            active_scene=self._deserialize_scene(payload.get("active_scene")),
+            active_encounter=self._deserialize_encounter(payload.get("active_encounter")),
+            dialogue_state=self._deserialize_dialogue(payload.get("dialogue_state")),
+            discovered_facts=list(payload.get("discovered_facts", [])),
+            committed_choices=list(payload.get("committed_choices", [])),
         )
 
     def _serialize_state(self, world: World, player: Player, memory: CampaignMemory) -> dict[str, object]:
@@ -288,8 +333,8 @@ class CampaignStore:
             "overarching_quest": world.overarching_quest,
             "active_quest": world.active_quest,
             "active_quest_id": world.active_quest_id,
-            "quests": [asdict(quest) for quest in world.quests],
-            "clocks": [asdict(clock) for clock in world.clocks],
+            "quests": [self._serialize_quest(quest) for quest in world.quests],
+            "clocks": [self._serialize_clock(clock) for clock in world.clocks],
             "usage_totals": world.usage_totals.to_dict(),
             "current_choices": list(world.current_choices),
             "current_activity": world.current_activity,
@@ -310,7 +355,281 @@ class CampaignStore:
             "conversations": {key: lines[-12:] for key, lines in world.conversations.items()},
             "recent_state_facts": world.state_facts[-24:],
             "memory": memory.latest_lines(limit=12),
+            "active_scene": self._serialize_scene(world.active_scene),
+            "active_encounter": self._serialize_encounter(world.active_encounter),
+            "dialogue_state": asdict(world.dialogue_state) if world.dialogue_state is not None else None,
         }
+
+    def _migrate_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        version = payload.get("schema_version", 0)
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError("Campaign save has an invalid schema_version.")
+        if version > SAVE_SCHEMA_VERSION:
+            raise UnsupportedSaveVersion(
+                f"Campaign save version {version} is newer than supported version {SAVE_SCHEMA_VERSION}."
+            )
+        if version == 0:
+            payload = self._migrate_v0_to_v1(payload)
+            version = 1
+        if version != SAVE_SCHEMA_VERSION:
+            raise UnsupportedSaveVersion(f"No migration path from campaign save version {version}.")
+        return payload
+
+    def _migrate_v0_to_v1(self, payload: dict[str, object]) -> dict[str, object]:
+        world = payload.get("world")
+        player = payload.get("player")
+        if not isinstance(world, dict) or not isinstance(player, dict):
+            raise ValueError("Legacy campaign save must contain world and player objects.")
+
+        locations = world.get("locations", [])
+        location_ids: dict[str, str] = {}
+        if isinstance(locations, list):
+            for index, raw in enumerate(locations):
+                if not isinstance(raw, dict):
+                    continue
+                raw.setdefault("id", f"location-{index + 1:03d}")
+                name = raw.get("name")
+                if isinstance(name, str):
+                    location_ids[name] = str(raw["id"])
+
+        npcs = world.get("npcs", [])
+        if isinstance(npcs, list):
+            for index, raw in enumerate(npcs):
+                if not isinstance(raw, dict):
+                    continue
+                raw.setdefault("id", f"npc-{index + 1:03d}")
+                location_name = raw.get("location_name")
+                raw.setdefault("location_id", location_ids.get(location_name) if isinstance(location_name, str) else None)
+
+        quests = world.get("quests", [])
+        if isinstance(quests, list):
+            for raw in quests:
+                if isinstance(raw, dict):
+                    raw.setdefault("stage_conditions", [])
+
+        clocks = world.get("clocks", [])
+        if isinstance(clocks, list):
+            for raw in clocks:
+                if isinstance(raw, dict):
+                    raw.setdefault("triggers", [])
+                    raw.setdefault("triggered", raw.get("status") == "complete")
+
+        position = player.get("position", {})
+        matching_location_id = None
+        if isinstance(position, dict) and isinstance(locations, list):
+            for raw in locations:
+                if isinstance(raw, dict) and raw.get("position") == position:
+                    matching_location_id = raw.get("id")
+                    break
+        scene_id = (
+            f"scene:{matching_location_id}"
+            if matching_location_id
+            else f"scene:{position.get('x', 0)},{position.get('y', 0)}"
+            if isinstance(position, dict)
+            else "scene:unknown"
+        )
+        world.setdefault(
+            "active_scene",
+            {
+                "id": scene_id,
+                "location_id": matching_location_id,
+                "available_actions": [],
+            },
+        )
+
+        movement_lock = world.get("movement_lock")
+        current_activity = world.get("current_activity")
+        if world.get("active_encounter") is None and (
+            current_activity == "combat"
+            or isinstance(movement_lock, str)
+            and any(token in movement_lock.lower() for token in ("fight", "combat"))
+        ):
+            world["active_encounter"] = {
+                "id": f"legacy-encounter-{world.get('tick', 0)}",
+                "kind": "combat",
+                "participants": [],
+                "objective": "Resolve the legacy combat state.",
+                "phase": "engaged",
+                "obstacles": [],
+                "exits": ["flee"],
+                "status": EncounterStatus.ACTIVE.value,
+                "resolution": None,
+            }
+        else:
+            world.setdefault("active_encounter", None)
+
+        world.setdefault("dialogue_state", None)
+        world.setdefault("discovered_facts", [])
+        world.setdefault("committed_choices", [])
+        payload["schema_version"] = 1
+        return payload
+
+    def _serialize_quest(self, quest: Quest) -> dict[str, object]:
+        payload = asdict(quest)
+        payload["stage_conditions"] = [
+            [
+                {
+                    "kind": condition.kind.value,
+                    "target_id": condition.target_id,
+                    "expected": condition.expected,
+                    "minimum": condition.minimum,
+                }
+                for condition in stage
+            ]
+            for stage in quest.stage_conditions
+        ]
+        return payload
+
+    def _deserialize_quest(self, payload: dict[str, object]) -> Quest:
+        raw = dict(payload)
+        stages: list[list[Condition]] = []
+        for raw_stage in raw.pop("stage_conditions", []):
+            conditions: list[Condition] = []
+            if isinstance(raw_stage, list):
+                for item in raw_stage:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        kind = ConditionKind(str(item.get("kind")))
+                    except ValueError:
+                        continue
+                    target_id = item.get("target_id")
+                    if not isinstance(target_id, str) or not target_id:
+                        continue
+                    expected = item.get("expected")
+                    minimum = item.get("minimum")
+                    conditions.append(
+                        Condition(
+                            kind=kind,
+                            target_id=target_id,
+                            expected=expected if isinstance(expected, str) else None,
+                            minimum=minimum if isinstance(minimum, int) and not isinstance(minimum, bool) else None,
+                        )
+                    )
+            stages.append(conditions)
+        return Quest(**raw, stage_conditions=stages)
+
+    def _serialize_clock(self, clock: QuestClock) -> dict[str, object]:
+        payload = asdict(clock)
+        payload["triggers"] = [
+            {
+                "id": trigger.id,
+                "kind": trigger.kind.value,
+                "target_id": trigger.target_id,
+                "amount": trigger.amount,
+                "text": trigger.text,
+                "fired": trigger.fired,
+            }
+            for trigger in clock.triggers
+        ]
+        return payload
+
+    def _deserialize_clock(self, payload: dict[str, object]) -> QuestClock:
+        raw = dict(payload)
+        triggers: list[ClockTrigger] = []
+        for item in raw.pop("triggers", []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                kind = ClockTriggerKind(str(item.get("kind")))
+            except ValueError:
+                continue
+            trigger_id = item.get("id")
+            if not isinstance(trigger_id, str) or not trigger_id:
+                continue
+            triggers.append(
+                ClockTrigger(
+                    id=trigger_id,
+                    kind=kind,
+                    target_id=item.get("target_id") if isinstance(item.get("target_id"), str) else None,
+                    amount=item.get("amount") if isinstance(item.get("amount"), int) else 0,
+                    text=item.get("text") if isinstance(item.get("text"), str) else "",
+                    fired=bool(item.get("fired", False)),
+                )
+            )
+        return QuestClock(**raw, triggers=triggers)
+
+    def _serialize_scene(self, scene: SceneState | None) -> dict[str, object] | None:
+        return asdict(scene) if scene is not None else None
+
+    def _deserialize_scene(self, payload: object) -> SceneState | None:
+        if not isinstance(payload, dict):
+            return None
+        return SceneState(
+            id=str(payload.get("id", "scene:unknown")),
+            location_id=payload.get("location_id") if isinstance(payload.get("location_id"), str) else None,
+            area_name=payload.get("area_name") if isinstance(payload.get("area_name"), str) else None,
+            step=int(payload.get("step", 0)),
+            tension=int(payload.get("tension", 0)),
+            theme=payload.get("theme") if isinstance(payload.get("theme"), str) else None,
+            hazard=payload.get("hazard") if isinstance(payload.get("hazard"), str) else None,
+            local_npc_id=payload.get("local_npc_id") if isinstance(payload.get("local_npc_id"), str) else None,
+            exit_open=bool(payload.get("exit_open", False)),
+            available_actions=[
+                action for action in payload.get("available_actions", []) if isinstance(action, str)
+            ],
+        )
+
+    def _serialize_encounter(self, encounter: EncounterState | None) -> dict[str, object] | None:
+        if encounter is None:
+            return None
+        payload = asdict(encounter)
+        payload["status"] = encounter.status.value
+        return payload
+
+    def _deserialize_encounter(self, payload: object) -> EncounterState | None:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            status = EncounterStatus(str(payload.get("status", EncounterStatus.ACTIVE.value)))
+        except ValueError:
+            status = EncounterStatus.ACTIVE
+        return EncounterState(
+            id=str(payload.get("id", "encounter:unknown")),
+            kind=str(payload.get("kind", "conflict")),
+            participants=[item for item in payload.get("participants", []) if isinstance(item, str)],
+            objective=str(payload.get("objective", "Resolve the encounter.")),
+            phase=str(payload.get("phase", "opening")),
+            obstacles=[item for item in payload.get("obstacles", []) if isinstance(item, str)],
+            exits=[item for item in payload.get("exits", []) if isinstance(item, str)],
+            status=status,
+            resolution=payload.get("resolution") if isinstance(payload.get("resolution"), str) else None,
+        )
+
+    def _deserialize_dialogue(self, payload: object) -> DialogueState | None:
+        if not isinstance(payload, dict):
+            return None
+        npc_id = payload.get("npc_id")
+        npc_name = payload.get("npc_name")
+        if not isinstance(npc_id, str) or not isinstance(npc_name, str):
+            return None
+        return DialogueState(
+            npc_id=npc_id,
+            npc_name=npc_name,
+            started_tick=int(payload.get("started_tick", 0)),
+            active=bool(payload.get("active", True)),
+        )
+
+    def _write_json_atomic(self, path: Path, payload: dict[str, object]) -> None:
+        temp_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = Path(handle.name)
+            temp_path.replace(path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
 
     def _serialize_player(self, player: Player) -> dict[str, object]:
         return {

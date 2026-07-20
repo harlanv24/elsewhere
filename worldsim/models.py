@@ -26,6 +26,30 @@ class Biome(str, Enum):
         }[self]
 
 
+class EncounterStatus(str, Enum):
+    ACTIVE = "active"
+    RESOLVED = "resolved"
+    ESCAPED = "escaped"
+
+
+class ConditionKind(str, Enum):
+    ITEM_ACQUIRED = "item_acquired"
+    NPC_RECRUITED = "npc_recruited"
+    FACT_DISCOVERED = "fact_discovered"
+    TARGET_DEFEATED = "target_defeated"
+    LOCATION_REACHED = "location_reached"
+    OBJECT_ACTIVATED = "object_activated"
+    CHOICE_COMMITTED = "choice_committed"
+    CLOCK_THRESHOLD = "clock_threshold"
+
+
+class ClockTriggerKind(str, Enum):
+    ADD_FACT = "add_fact"
+    FAIL_QUEST = "fail_quest"
+    STABILITY_DELTA = "stability_delta"
+    START_ENCOUNTER = "start_encounter"
+
+
 @dataclass(frozen=True)
 class Position:
     x: int
@@ -39,6 +63,7 @@ class Location:
     biome: Biome
     danger: int
     summary: str
+    id: str = ""
 
 
 @dataclass
@@ -47,6 +72,8 @@ class Npc:
     role: str
     disposition: str
     location_name: str
+    id: str = ""
+    location_id: str | None = None
 
 
 @dataclass
@@ -72,6 +99,16 @@ class Event:
 
 
 @dataclass
+class Condition:
+    """An engine-verifiable requirement for completing a quest stage."""
+
+    kind: ConditionKind
+    target_id: str
+    expected: str | None = None
+    minimum: int | None = None
+
+
+@dataclass
 class Quest:
     id: str
     title: str
@@ -84,6 +121,19 @@ class Quest:
     related_locations: list[str] = field(default_factory=list)
     related_npcs: list[str] = field(default_factory=list)
     discoveries: list[str] = field(default_factory=list)
+    stage_conditions: list[list[Condition]] = field(default_factory=list)
+
+
+@dataclass
+class ClockTrigger:
+    """A structured, exactly-once consequence fired when a clock fills."""
+
+    id: str
+    kind: ClockTriggerKind
+    target_id: str | None = None
+    amount: int = 0
+    text: str = ""
+    fired: bool = False
 
 
 @dataclass
@@ -94,6 +144,53 @@ class QuestClock:
     max_value: int = 6
     description: str = ""
     status: str = "active"
+    triggers: list[ClockTrigger] = field(default_factory=list)
+    triggered: bool = False
+
+
+@dataclass
+class SceneState:
+    """Persistent engine-owned state for the player's current scene."""
+
+    id: str
+    location_id: str | None = None
+    area_name: str | None = None
+    step: int = 0
+    tension: int = 0
+    theme: str | None = None
+    hazard: str | None = None
+    local_npc_id: str | None = None
+    exit_open: bool = False
+    available_actions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EncounterState:
+    """Persistent encounter state; movement locks are derived from its status."""
+
+    id: str
+    kind: str
+    participants: list[str]
+    objective: str
+    phase: str = "opening"
+    obstacles: list[str] = field(default_factory=list)
+    exits: list[str] = field(default_factory=list)
+    status: EncounterStatus = EncounterStatus.ACTIVE
+    resolution: str | None = None
+
+    @property
+    def movement_locked(self) -> bool:
+        return self.status == EncounterStatus.ACTIVE
+
+
+@dataclass
+class DialogueState:
+    """Explicit, persistent conversation mode instead of history-based inference."""
+
+    npc_id: str
+    npc_name: str
+    started_tick: int
+    active: bool = True
 
 
 @dataclass
@@ -112,6 +209,7 @@ class DirectorBeat:
     quest_progress_delta: int = 0
     complete_current_stage: bool = False
     clock_effects: list[dict[str, object]] = field(default_factory=list)
+    facts_discovered: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -152,6 +250,11 @@ class World:
     inventory_descriptions: dict[str, str] = field(default_factory=dict)
     skill_descriptions: dict[str, str] = field(default_factory=dict)
     homeland_descriptions: dict[str, str] = field(default_factory=dict)
+    active_scene: SceneState | None = None
+    active_encounter: EncounterState | None = None
+    dialogue_state: DialogueState | None = None
+    discovered_facts: list[str] = field(default_factory=list)
+    committed_choices: list[str] = field(default_factory=list)
 
 
 @dataclass

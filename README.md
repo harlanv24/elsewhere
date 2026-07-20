@@ -23,8 +23,9 @@ That keeps the game coherent while still allowing an LLM to improvise.
 - A `MockDirector` that behaves like a local DM
 - A `Director` interface where a real LLM backend can be plugged in later
 - Optional local LLM director using JSON prompts and OpenAI-compatible chat completions
-- Versioned campaign saves with migration from the original unversioned format
-- Deterministic pytest regression coverage for state safety
+- Versioned campaign saves with migrations from schema versions 0 and 1
+- Persisted, replayable turn records for freeform actions
+- Deterministic pytest regression coverage for state safety and turn resolution
 
 ## Run
 
@@ -48,7 +49,10 @@ python3 main.py
 - `quit`
 - `end conversation`
 
-You can also type freeform actions, such as `take journal`, `read the inscription`, or `open the rusted box`. The director proposes the attempt and effects. When a check is required, Phase 1 now commits inventory and scene effects only after an engine-owned success.
+You can also type freeform actions, such as `take journal`, `read the inscription`,
+or `open the rusted box`. The director proposes a typed intent and effects
+without deciding the outcome. The engine rolls, validates and commits the
+effects transactionally, then asks the director to narrate the known result.
 
 During an active conversation, bare prose is dialogue. Global commands such as
 `quit`, `help`, `inventory`, and `end conversation` remain commands without a
@@ -66,6 +70,15 @@ leading slash.
 - World generation
 - Command parsing
 - Deterministic resolution of movement, combat, rest, and discovery
+- Freeform orchestration through typed intent, check, outcome, and turn records
+
+`worldsim/turn_resolution.py`
+
+- Transactional effect validation, commit, rollback, and replay
+
+`worldsim/turn_effects.py`
+
+- Focused freeform-effect preparation, legality policy, and commit handlers
 
 `worldsim/director.py`
 
@@ -77,7 +90,7 @@ leading slash.
 `worldsim/schemas.py`
 
 - JSON payloads sent to the director layer
-- JSON response schemas for narration and action beats
+- JSON response schemas for narration, action intents, and legacy action beats
 - Response parsing into engine-owned models
 
 `worldsim/llm_client.py`
@@ -91,7 +104,7 @@ leading slash.
 `worldsim/memory.py`
 
 - Compact long-term memory store
-- Versioned local save/load with version-0 migration and atomic replacement
+- Versioned local save/load with version-0/version-1 migrations and atomic replacement
 - Retrieval of relevant memories for the director layer
 
 `worldsim/tui.py`
@@ -108,32 +121,45 @@ leading slash.
 
 ## Wiring In A Real LLM
 
-The director should never directly mutate state. It should return structured intent, for example:
+The director never directly mutates state. For freeform actions it returns
+structured intent without an outcome, for example:
 
 ```json
 {
-  "title": "Ruined Shrine",
-  "narration": "A broken shrine leans out of the mist.",
-  "mechanical_request": "exploration_check",
+  "title": "Force the Shrine Door",
+  "stakes": "The warped door may give way or draw attention.",
+  "check_kind": "exploration_check",
   "difficulty": 11,
-  "tags": ["mystery", "ancient"],
-  "follow_up_hook": "Someone still leaves fresh candles here."
+  "tags": ["exploration"],
+  "choices": ["try the latch", "look for another entrance"],
+  "proposed_effects": [
+    {
+      "kind": "object_status",
+      "target_id": "shrine door",
+      "value": "open",
+      "amount": 0,
+      "condition": "success",
+      "flag": false
+    }
+  ]
 }
 ```
 
-The engine then decides:
+The engine then:
 
-- whether a check is needed
-- what dice to roll
-- whether the player takes damage
-- what loot or XP is granted
-- how the world state changes
+- validates the requested check and effects
+- resolves the engine-owned roll
+- commits the accepted effect batch or rolls it back
+- evaluates progression and encounter consequences
+- creates a persisted `TurnRecord`
+- gives the resolved record and updated state to the narration pass
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
 
-The architecture is currently in a phased migration. Phase 1 supplies the
-safety boundary and compatibility models; the unified intent → check → reducer
-→ outcome → narration pipeline remains Phase 2 work. See
+The architecture is currently in a phased migration. Phase 2 now supplies the
+unified intent-to-check-to-reducer-to-outcome-to-narration pipeline for
+freeform actions. Explicit commands remain compatible through the typed check
+adapter; moving persistent area state into the pipeline remains Phase 3 work. See
 [`docs/architecture-audit.md`](docs/architecture-audit.md) for the verified
 baseline findings, ownership model, phase gates, and compatibility risks.
 
@@ -230,12 +256,12 @@ The System tab shows the exact debug log path for the current session.
 
 ## Save Schema
 
-`data/campaign.json` now includes `schema_version: 1`. Existing saves without a
-version are treated as version 0 and migrated in memory when loaded. Migration
-backfills stable location/NPC IDs, persistent scene state, and a structured
-encounter for legacy combat locks. The next save writes version 1. Saves from a
-newer unsupported schema fail with an explicit error instead of being
-misread.
+`data/campaign.json` now includes `schema_version: 2`. Existing saves without a
+version are treated as version 0; schema version 1 saves are also migrated in
+memory when loaded. The migrations backfill stable location/NPC IDs, persistent
+scene state, a structured encounter for legacy combat locks, and an empty turn
+history where one did not exist. The next save writes version 2. Saves from a
+newer unsupported schema fail with an explicit error instead of being misread.
 
 Both `campaign.json` and the debug `state.json` mirror are written through a
 temporary file followed by atomic replacement.
@@ -250,10 +276,10 @@ python -m pytest
 python -m compileall -q main.py worldsim tests
 ```
 
-The Phase 1 suite uses deterministic seeds and covers failed-effect rollback,
-encounter escape cleanup, dialogue command routing, structured dialogue quest
-evidence, narrative/location authority, clock consequences, quest completion
-validation, and save migration/round-tripping.
+The deterministic suite covers the Phase 1 safety boundary plus Phase 2
+pre-roll/post-roll ordering, transactional rollback, successful and failed door
+effects, persisted turn records, replay without rerolling, explicit-command
+compatibility, and save migration/round-tripping.
 
 When debugging a live LLM turn, compare:
 

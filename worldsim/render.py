@@ -120,6 +120,7 @@ def _player_lines(player: Player) -> list[str]:
 def _summary_lines(world: World, engine: WorldEngine) -> list[str]:
     counts = engine.summary_counts(world)
     return [
+        f"Campaign: {world.campaign_status.value}",
         f"Age: {world.tick} turns",
         f"Locations: {counts['locations']}",
         f"NPCs: {counts['npcs']}",
@@ -136,8 +137,8 @@ def _quest_lines(world: World) -> list[str]:
     stage = active.stages[min(active.current_stage, len(active.stages) - 1)] if active.stages else active.goal
     lines = [
         f"Active: {active.title}",
-        stage,
-        f"Progress: {active.progress}/{active.progress_required}",
+        stage.description if hasattr(stage, "description") else str(stage),
+        f"Status: {active.status.value}",
     ]
     active_clocks = [clock for clock in world.clocks if clock.status == "active"]
     if active_clocks:

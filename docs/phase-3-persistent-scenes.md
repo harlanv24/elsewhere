@@ -52,5 +52,6 @@ Save schema version 3 adds scene mode, parent scene ID, and entry tick. Version
 and location transition effects replay without consulting the director or
 consuming RNG state.
 
-Phase 4 remains responsible for fully typed quest lifecycle, prerequisites,
-finale activation, victory, defeat, and epilogues.
+Phase 4 adds the typed quest lifecycle, prerequisites, clock consequences,
+finale activation, victory, defeat, abandonment, and epilogues described in
+[`phase-4-campaign-resolution.md`](phase-4-campaign-resolution.md).

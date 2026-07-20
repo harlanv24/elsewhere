@@ -23,9 +23,11 @@ That keeps the game coherent while still allowing an LLM to improvise.
 - A `MockDirector` that behaves like a local DM
 - A `Director` interface where a real LLM backend can be plugged in later
 - Optional local LLM director using JSON prompts and OpenAI-compatible chat completions
-- Versioned campaign saves with migrations from schema versions 0, 1, and 2
+- Versioned campaign saves with migrations from schema versions 0 through 3
 - Persisted, replayable turn records for freeform and local-scene actions
 - Engine-owned local scenes, depth, tension, hazards, exits, and dialogue state
+- Condition-driven quest stages, prerequisite chains, structured clock triggers,
+  finales, victory, defeat, abandonment, and persisted epilogues
 - Deterministic pytest regression coverage for state safety and turn resolution
 
 ## Run
@@ -53,6 +55,9 @@ python3 main.py
 - `help`
 - `quit`
 - `end conversation`
+- `campaign status`
+- `resolve finale`
+- `abandon campaign`
 
 You can also type freeform actions, such as `take journal`, `read the inscription`,
 or `open the rusted box`. The director proposes a typed intent and effects
@@ -89,6 +94,12 @@ leading slash.
 
 - Persistent overworld/local-scene transitions
 - Engine-owned local movement, exit checks, available actions, and replay
+
+`worldsim/progression.py`
+
+- Typed quest-stage conditions and prerequisite lifecycle
+- Stable-ID quest generation and authoritative condition evaluation
+- Exactly-once clock triggers, finale activation, terminal outcomes, and replay
 
 `worldsim/director.py`
 
@@ -166,10 +177,11 @@ The engine then:
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
 
-The architecture is currently in a phased migration. Phase 3 now keeps local
-scene state in the engine, routes local movement and exits through persisted
-turns, derives locks from encounters, and supports validated stable-ID travel
-between named locations. Quest lifecycle and campaign endings remain Phase 4.
+The architecture is currently in a phased migration. Phase 4 now represents
+quest stages as typed condition plans, chains generated quests through explicit
+prerequisites, applies structured clock consequences exactly once, and persists
+finale, victory, defeat, abandonment, and epilogue state. Context selection and
+LLM retry/repair contracts remain Phase 5.
 See
 [`docs/architecture-audit.md`](docs/architecture-audit.md) for the verified
 baseline findings, ownership model, phase gates, and compatibility risks.
@@ -267,12 +279,13 @@ The System tab shows the exact debug log path for the current session.
 
 ## Save Schema
 
-`data/campaign.json` now includes `schema_version: 3`. Existing saves without a
-version are treated as version 0; schema versions 1 and 2 are also migrated in
+`data/campaign.json` now includes `schema_version: 4`. Existing saves without a
+version are treated as version 0; schema versions 1 through 3 are migrated in
 memory when loaded. The migrations backfill stable location/NPC IDs, structured
-encounters, turn history, and local-scene lifecycle fields. The next save writes
-version 3. Saves from a newer unsupported schema fail with an explicit error
-instead of being misread.
+encounters, turn history, local-scene lifecycle fields, typed quest stages,
+campaign status, finale requirements, and resolved encounter IDs. The next save
+writes version 4. Saves from a newer unsupported schema fail with an explicit
+error instead of being misread.
 
 Both `campaign.json` and the debug `state.json` mirror are written through a
 temporary file followed by atomic replacement.
@@ -288,9 +301,10 @@ python -m compileall -q main.py worldsim tests
 ```
 
 The deterministic suite covers the Phase 1 safety boundary, Phase 2 turn
-resolution, and Phase 3 local-scene persistence, common d20 exits, alternate
-encounter escape, dialogue lifecycle, derived actions, named-location travel,
-replay without rerolling, and save migration/round-tripping.
+resolution, Phase 3 scene persistence, and Phase 4 campaign resolution. It
+includes condition-grounded quest completion, irrelevant evidence, dialogue
+recruitment, prerequisite activation, structured clock consequences, finale
+victory/defeat, terminal command gating, replay, and save migration.
 
 When debugging a live LLM turn, compare:
 

@@ -37,6 +37,34 @@ class SceneMode(str, Enum):
     LOCAL = "local"
 
 
+class CampaignStatus(str, Enum):
+    ACTIVE = "active"
+    FINALE = "finale"
+    VICTORY = "victory"
+    DEFEAT = "defeat"
+    ABANDONED = "abandoned"
+
+
+class QuestStatus(str, Enum):
+    LOCKED = "locked"
+    AVAILABLE = "available"
+    ACTIVE = "active"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+class QuestStageStatus(str, Enum):
+    LOCKED = "locked"
+    ACTIVE = "active"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+class ClockStatus(str, Enum):
+    ACTIVE = "active"
+    COMPLETE = "complete"
+
+
 class ConditionKind(str, Enum):
     ITEM_ACQUIRED = "item_acquired"
     NPC_RECRUITED = "npc_recruited"
@@ -46,13 +74,19 @@ class ConditionKind(str, Enum):
     OBJECT_ACTIVATED = "object_activated"
     CHOICE_COMMITTED = "choice_committed"
     CLOCK_THRESHOLD = "clock_threshold"
+    QUEST_COMPLETED = "quest_completed"
 
 
 class ClockTriggerKind(str, Enum):
     ADD_FACT = "add_fact"
     FAIL_QUEST = "fail_quest"
+    ACTIVATE_QUEST = "activate_quest"
     STABILITY_DELTA = "stability_delta"
     START_ENCOUNTER = "start_encounter"
+    SCENE_TENSION = "scene_tension"
+    START_FINALE = "start_finale"
+    CAMPAIGN_VICTORY = "campaign_victory"
+    CAMPAIGN_DEFEAT = "campaign_defeat"
 
 
 class ActionKind(str, Enum):
@@ -85,6 +119,10 @@ class EffectKind(str, Enum):
     SCENE_STEP = "scene_step"
     SCENE_TENSION = "scene_tension"
     LOCATION_TRANSITION = "location_transition"
+    NPC_DISPOSITION = "npc_disposition"
+    CHOICE_COMMIT = "choice_commit"
+    CAMPAIGN_VICTORY = "campaign_victory"
+    CAMPAIGN_DEFEAT = "campaign_defeat"
 
 
 class EffectCondition(str, Enum):
@@ -157,19 +195,77 @@ class Condition:
 
 
 @dataclass
+class QuestStage:
+    """A typed quest step whose completion is derived from authoritative state."""
+
+    id: str
+    title: str
+    description: str
+    conditions: list[Condition] = field(default_factory=list)
+    status: QuestStageStatus = QuestStageStatus.LOCKED
+
+
+@dataclass
 class Quest:
     id: str
     title: str
     goal: str
-    stages: list[str]
+    stages: list[QuestStage | str]
     current_stage: int = 0
     progress: int = 0
     progress_required: int = 2
-    status: str = "active"
+    status: QuestStatus | str = QuestStatus.ACTIVE
     related_locations: list[str] = field(default_factory=list)
     related_npcs: list[str] = field(default_factory=list)
     discoveries: list[str] = field(default_factory=list)
     stage_conditions: list[list[Condition]] = field(default_factory=list)
+    prerequisite_quest_ids: list[str] = field(default_factory=list)
+    required_for_finale: bool = True
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            self.status = QuestStatus(self.status)
+        except ValueError:
+            self.status = QuestStatus.ACTIVE
+        typed_stages: list[QuestStage] = []
+        for index, stage in enumerate(self.stages):
+            conditions = (
+                list(self.stage_conditions[index])
+                if index < len(self.stage_conditions)
+                else []
+            )
+            if isinstance(stage, QuestStage):
+                if conditions and not stage.conditions:
+                    stage.conditions = conditions
+                typed_stages.append(stage)
+                continue
+            description = " ".join(str(stage).split()) or f"Stage {index + 1}"
+            typed_stages.append(
+                QuestStage(
+                    id=f"{self.id}:stage:{index + 1}",
+                    title=description,
+                    description=description,
+                    conditions=conditions,
+                )
+            )
+        self.stages = typed_stages
+        self.stage_conditions = [list(stage.conditions) for stage in typed_stages]
+        for index, stage in enumerate(typed_stages):
+            if self.status == QuestStatus.FAILED:
+                stage.status = (
+                    QuestStageStatus.COMPLETE
+                    if index < self.current_stage
+                    else QuestStageStatus.FAILED
+                    if index == self.current_stage
+                    else QuestStageStatus.LOCKED
+                )
+            elif self.status == QuestStatus.COMPLETE or index < self.current_stage:
+                stage.status = QuestStageStatus.COMPLETE
+            elif self.status == QuestStatus.ACTIVE and index == self.current_stage:
+                stage.status = QuestStageStatus.ACTIVE
+            else:
+                stage.status = QuestStageStatus.LOCKED
 
 
 @dataclass
@@ -191,9 +287,15 @@ class QuestClock:
     value: int = 0
     max_value: int = 6
     description: str = ""
-    status: str = "active"
+    status: ClockStatus | str = ClockStatus.ACTIVE
     triggers: list[ClockTrigger] = field(default_factory=list)
     triggered: bool = False
+
+    def __post_init__(self) -> None:
+        try:
+            self.status = ClockStatus(self.status)
+        except ValueError:
+            self.status = ClockStatus.ACTIVE
 
 
 @dataclass
@@ -337,6 +439,8 @@ class DirectorBeat:
     complete_current_stage: bool = False
     clock_effects: list[dict[str, object]] = field(default_factory=list)
     facts_discovered: list[str] = field(default_factory=list)
+    npc_disposition_changes: list[dict[str, str]] = field(default_factory=list)
+    choices_committed: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -382,6 +486,13 @@ class World:
     dialogue_state: DialogueState | None = None
     discovered_facts: list[str] = field(default_factory=list)
     committed_choices: list[str] = field(default_factory=list)
+    resolved_encounter_ids: list[str] = field(default_factory=list)
+    campaign_status: CampaignStatus = CampaignStatus.ACTIVE
+    main_quest_id: str | None = None
+    finale_requirements: list[Condition] = field(default_factory=list)
+    finale_title: str = "The Final Reckoning"
+    epilogue: str | None = None
+    ending_reason: str | None = None
     turn_records: list[TurnRecord] = field(default_factory=list)
 
 

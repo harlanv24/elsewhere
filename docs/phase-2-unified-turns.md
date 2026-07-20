@@ -40,7 +40,8 @@ Phase 3 extends the chain to version 3 with local-scene lifecycle fields.
 ## Deferred to later phases
 
 - Persistent TUI area movement and dialogue lifecycle were completed in Phase 3.
-- Fully typed quest lifecycle, finales, and campaign endings are Phase 4.
+- Typed quest lifecycle, finales, and campaign endings are implemented in
+  Phase 4.
 - Relevance-budgeted director context and schema repair are Phase 5.
 - Stable game-object records, route graphs, and layered ASCII rendering remain
   in their planned phases.

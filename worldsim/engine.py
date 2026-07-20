@@ -12,11 +12,8 @@ from worldsim.models import (
     Biome,
     CheckKind,
     CheckResult,
-    ClockTrigger,
-    ClockTriggerKind,
     CommandResult,
     Condition,
-    ConditionKind,
     DialogueState,
     DirectorBeat,
     EncounterState,
@@ -32,6 +29,7 @@ from worldsim.models import (
     TurnRecord,
     World,
 )
+from worldsim.progression import ProgressionService
 from worldsim.scenes import SceneService
 from worldsim.turn_effects import TurnEffectService
 from worldsim.turn_resolution import StateReducer
@@ -42,6 +40,7 @@ class WorldEngine:
         self.seed = seed if seed is not None else secrets.randbelow(1_000_000_000)
         self.random = random.Random(self.seed)
         self.state_reducer = StateReducer()
+        self.progression = ProgressionService(self)
         self.turn_effects = TurnEffectService(self)
         self.scene_service = SceneService(self)
 
@@ -114,6 +113,16 @@ class WorldEngine:
         if text in {"quit", "exit"}:
             return CommandResult("The world will wait.", should_quit=True)
 
+        campaign_result = self.progression.resolve_command(
+            raw_command,
+            world,
+            player,
+            director,
+            memory,
+        )
+        if campaign_result is not None:
+            return campaign_result
+
         if text in {"end conversation", "end dialogue", "goodbye"}:
             if world.dialogue_state is None or not world.dialogue_state.active:
                 return CommandResult("You are not in an active conversation.")
@@ -143,7 +152,7 @@ class WorldEngine:
 
         if text == "help":
             return CommandResult(
-                "Commands: north south east west, look, explore, enter area <name>, leave area, push deeper, pull back, force exit, talk, say <message>, end conversation, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare prose is dialogue; quit, help, inventory, and end conversation remain global commands, and other commands can be prefixed with /."
+                "Commands: north south east west, look, explore, enter area <name>, leave area, push deeper, pull back, force exit, talk, say <message>, end conversation, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, campaign status, resolve finale, abandon campaign, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare prose is dialogue; quit, help, inventory, and end conversation remain global commands, and other commands can be prefixed with /."
             )
 
         if text in {"north", "south", "east", "west", "n", "s", "e", "w"} or text.startswith("move "):
@@ -546,6 +555,9 @@ class WorldEngine:
             encounter.status = status
             encounter.phase = "resolved"
             encounter.resolution = resolution
+            if status == EncounterStatus.RESOLVED and encounter.id not in world.resolved_encounter_ids:
+                world.resolved_encounter_ids.append(encounter.id)
+                del world.resolved_encounter_ids[:-80]
         world.current_activity = None
         world.movement_lock = None
 
@@ -745,62 +757,10 @@ class WorldEngine:
         }
 
     def _ensure_progression(self, world: World) -> None:
-        if not world.quests:
-            hooks = world.quest_hooks or [world.overarching_quest]
-            world.quests = [self._quest_from_hook(hook, index, world) for index, hook in enumerate(hooks[:6])]
-        if world.quests and not world.active_quest_id:
-            active = next((quest for quest in world.quests if quest.status == "active"), world.quests[0])
-            world.active_quest_id = active.id
-        if not world.clocks:
-            world.clocks = [
-                QuestClock(
-                    id="central_threat",
-                    title="Central Threat",
-                    value=1,
-                    max_value=6,
-                    description=world.overarching_quest,
-                    triggers=[
-                        ClockTrigger(
-                            id="central-threat-consequence",
-                            kind=ClockTriggerKind.STABILITY_DELTA,
-                            amount=-10,
-                            text="The central threat destabilizes the campaign.",
-                        ),
-                        ClockTrigger(
-                            id="central-threat-fact",
-                            kind=ClockTriggerKind.ADD_FACT,
-                            target_id="central_threat_reached_breaking_point",
-                            text="The central threat reached its breaking point.",
-                        ),
-                    ],
-                )
-            ]
-        for clock in world.clocks:
-            if not clock.triggers:
-                clock.triggers.append(
-                    ClockTrigger(
-                        id=f"{clock.id}-breaking-point",
-                        kind=ClockTriggerKind.ADD_FACT,
-                        target_id=f"clock:{clock.id}:breaking_point",
-                        text=f"{clock.title} reached its breaking point.",
-                    )
-                )
-        self._sync_active_quest_display(world)
+        self.progression.ensure(world)
 
     def _quest_from_hook(self, hook: str, index: int, world: World) -> Quest:
-        title = self._quest_title(hook, index)
-        return Quest(
-            id=self._slug(f"{index + 1}-{title}"),
-            title=title,
-            goal=hook,
-            stages=[
-                "Find a concrete lead.",
-                "Act on the lead and expose what is really happening.",
-                "Resolve the local threat and connect it back to the campaign quest.",
-            ],
-            related_locations=[location.name for location in world.locations[:2]],
-            related_npcs=[npc.name for npc in world.npcs[:2]],
-        )
+        return self.progression.quest_from_hook(hook, index, world)
 
     def _quest_title(self, hook: str, index: int) -> str:
         cleaned = " ".join(hook.strip().rstrip(".").split())
@@ -822,21 +782,10 @@ class WorldEngine:
         return "".join(chars).strip("-")[:60] or "quest"
 
     def _active_quest(self, world: World) -> Quest | None:
-        self._ensure_progression(world)
-        return next((quest for quest in world.quests if quest.id == world.active_quest_id), None)
+        return self.progression.active_quest(world)
 
     def _sync_active_quest_display(self, world: World) -> None:
-        quest = next((item for item in world.quests if item.id == world.active_quest_id), None)
-        if quest is None:
-            world.active_quest = world.overarching_quest
-            return
-        if quest.status != "active":
-            replacement = next((item for item in world.quests if item.status == "active"), None)
-            if replacement is not None:
-                world.active_quest_id = replacement.id
-                quest = replacement
-        stage = quest.stages[min(quest.current_stage, len(quest.stages) - 1)] if quest.stages else quest.goal
-        world.active_quest = f"{quest.title}: {stage}"
+        self.progression.sync_active_quest_display(world)
 
     def _apply_progression(
         self,
@@ -847,44 +796,14 @@ class WorldEngine:
         location: Location | None,
         success: bool | None,
     ) -> None:
-        self._ensure_progression(world)
-        progress_allowed = success is not False
-        if progress_allowed:
-            for fact in beat.facts_discovered:
-                normalized = " ".join(fact.split())
-                if normalized and normalized not in world.discovered_facts:
-                    world.discovered_facts.append(normalized)
-                    del world.discovered_facts[:-80]
-                    self._remember_state_fact(world, f"Fact discovered: {normalized}", world.tick)
-        quest = self._active_quest(world)
-        if quest is not None and progress_allowed:
-            delta = beat.quest_progress_delta
-            progress_attempted = bool(delta or beat.complete_current_stage or beat.facts_discovered)
-            if beat.progress_summary and progress_attempted:
-                summary = beat.progress_summary or f"{player.name} made progress on {quest.title}."
-                quest.discoveries.append(summary[:180])
-                del quest.discoveries[:-8]
-                quest.progress = min(quest.progress_required, quest.progress + delta)
-                self._remember_state_fact(world, f"Quest progress on {quest.title}: {summary}", world.tick)
-                memory.remember(
-                    "quest",
-                    quest.id,
-                    f"{quest.title}: {summary}",
-                    world.tick,
-                    importance=9,
-                    tags=["quest", quest.title, location.name if location else "frontier"],
-                )
-            elif delta:
-                quest.progress = min(quest.progress_required, quest.progress + delta)
-            if progress_attempted and self._quest_stage_satisfied(quest, world, player, location):
-                self._advance_quest_stage(world, quest, memory)
-
-        for effect in beat.clock_effects:
-            delta = effect.get("delta", 0)
-            if success is False and isinstance(delta, int) and delta < 0:
-                continue
-            self._apply_clock_effect(world, effect)
-        self._sync_active_quest_display(world)
+        self.progression.apply_beat(
+            world,
+            player,
+            beat,
+            memory,
+            location,
+            success,
+        )
 
     def _quest_stage_satisfied(
         self,
@@ -893,14 +812,11 @@ class WorldEngine:
         player: Player,
         location: Location | None,
     ) -> bool:
-        conditions = (
-            quest.stage_conditions[quest.current_stage]
-            if quest.current_stage < len(quest.stage_conditions)
-            else []
+        stage = self.progression.current_stage(quest)
+        return bool(stage and stage.conditions) and all(
+            self.progression.condition_satisfied(condition, world, player, location)
+            for condition in stage.conditions
         )
-        if not conditions:
-            return quest.progress >= quest.progress_required
-        return all(self._condition_satisfied(condition, world, player, location) for condition in conditions)
 
     def _condition_satisfied(
         self,
@@ -909,121 +825,23 @@ class WorldEngine:
         player: Player,
         location: Location | None,
     ) -> bool:
-        target = condition.target_id.casefold()
-        if condition.kind == ConditionKind.ITEM_ACQUIRED:
-            return any(item.casefold() == target for item in player.inventory)
-        if condition.kind == ConditionKind.NPC_RECRUITED:
-            npc = next(
-                (item for item in world.npcs if item.id.casefold() == target or item.name.casefold() == target),
-                None,
-            )
-            expected = (condition.expected or "recruited").casefold()
-            return npc is not None and npc.disposition.casefold() == expected
-        if condition.kind == ConditionKind.FACT_DISCOVERED:
-            return any(fact.casefold() == target for fact in world.discovered_facts)
-        if condition.kind == ConditionKind.TARGET_DEFEATED:
-            encounter = world.active_encounter
-            return (
-                encounter is not None
-                and encounter.id.casefold() == target
-                and encounter.status == EncounterStatus.RESOLVED
-            )
-        if condition.kind == ConditionKind.LOCATION_REACHED:
-            return location is not None and (
-                location.id.casefold() == target or location.name.casefold() == target
-            )
-        if condition.kind == ConditionKind.OBJECT_ACTIVATED:
-            expected = (condition.expected or "activated").casefold()
-            return any(
-                (
-                    key.casefold() == target
-                    or str(record.get("id", "")).casefold() == target
-                    or str(record.get("name", "")).casefold() == target
-                )
-                and str(record.get("status", "")).casefold() == expected
-                for key, record in world.object_states.items()
-            )
-        if condition.kind == ConditionKind.CHOICE_COMMITTED:
-            return any(choice.casefold() == target for choice in world.committed_choices)
-        if condition.kind == ConditionKind.CLOCK_THRESHOLD:
-            clock = next(
-                (item for item in world.clocks if item.id.casefold() == target or item.title.casefold() == target),
-                None,
-            )
-            threshold = condition.minimum if condition.minimum is not None else (clock.max_value if clock else 0)
-            return clock is not None and clock.value >= threshold
-        return False
+        return self.progression.condition_satisfied(
+            condition,
+            world,
+            player,
+            location,
+        )
 
     def _advance_quest_stage(self, world: World, quest: Quest, memory: CampaignMemory) -> None:
-        quest.progress = 0
-        if quest.current_stage + 1 >= len(quest.stages):
-            quest.status = "complete"
-            self._add_event(world, "quest", f"Quest completed: {quest.title}.")
-            memory.remember("quest", quest.id, f"{quest.title} is complete.", world.tick, importance=10, tags=["quest"])
-            replacement = next((item for item in world.quests if item.status == "active" and item.id != quest.id), None)
-            world.active_quest_id = replacement.id if replacement is not None else quest.id
-            return
-        quest.current_stage += 1
-        stage = quest.stages[quest.current_stage]
-        self._add_event(world, "quest", f"{quest.title} advanced: {stage}")
-        memory.remember("quest", quest.id, f"{quest.title} advanced to: {stage}", world.tick, importance=9, tags=["quest"])
+        stage = self.progression.current_stage(quest)
+        if stage is not None:
+            self.progression._complete_stage(world, quest, stage, memory)
 
     def _apply_clock_effect(self, world: World, effect: dict[str, object]) -> None:
-        clock_id = effect.get("clock_id")
-        delta = effect.get("delta")
-        if not isinstance(clock_id, str) or not isinstance(delta, int) or delta == 0:
-            return
-        clock = next((item for item in world.clocks if item.id == clock_id and item.status == "active"), None)
-        if clock is None:
-            return
-        before = clock.value
-        clock.value = max(0, min(clock.max_value, clock.value + delta))
-        if clock.value == before:
-            return
-        reason = effect.get("reason")
-        reason_text = reason if isinstance(reason, str) and reason.strip() else "pressure changed"
-        self._remember_state_fact(world, f"Clock {clock.title} changed from {before} to {clock.value}: {reason_text}", world.tick)
-        if clock.value >= clock.max_value:
-            clock.status = "complete"
-            self._add_event(world, "clock", f"{clock.title} reaches its breaking point: {reason_text}", severity="warning")
-            self._fire_clock_triggers(world, clock)
+        self.progression.apply_clock_effect(world, effect)
 
     def _fire_clock_triggers(self, world: World, clock: QuestClock) -> None:
-        if clock.triggered:
-            return
-        for trigger in clock.triggers:
-            if trigger.fired:
-                continue
-            if trigger.kind == ClockTriggerKind.ADD_FACT:
-                fact = trigger.target_id or trigger.text or f"clock:{clock.id}:complete"
-                if fact not in world.discovered_facts:
-                    world.discovered_facts.append(fact)
-                self._remember_state_fact(world, trigger.text or f"{clock.title} completed.", world.tick)
-            elif trigger.kind == ClockTriggerKind.FAIL_QUEST:
-                quest = next((item for item in world.quests if item.id == trigger.target_id), None)
-                if quest is not None and quest.status == "active":
-                    quest.status = "failed"
-                    self._add_event(world, "quest", f"Quest failed: {quest.title}.", severity="warning")
-            elif trigger.kind == ClockTriggerKind.STABILITY_DELTA:
-                world.stability = max(0, min(100, world.stability + trigger.amount))
-                self._remember_state_fact(
-                    world,
-                    trigger.text or f"{clock.title} changed stability by {trigger.amount}.",
-                    world.tick,
-                )
-            elif trigger.kind == ClockTriggerKind.START_ENCOUNTER:
-                world.active_encounter = EncounterState(
-                    id=trigger.target_id or f"clock-encounter-{clock.id}",
-                    kind="clock_trigger",
-                    participants=[],
-                    objective=trigger.text or f"Survive the consequences of {clock.title}.",
-                    phase="opening",
-                    exits=["flee"],
-                )
-                world.current_activity = "combat"
-                world.movement_lock = "you are in a fight"
-            trigger.fired = True
-        clock.triggered = True
+        self.progression.fire_clock_triggers(world, clock)
 
     def summary_counts(self, world: World) -> dict[str, int]:
         return {
@@ -1086,6 +904,13 @@ class WorldEngine:
             lambda effect: self.turn_effects.validate(effect, intent, world, player),
             lambda effect: self.turn_effects.commit(effect, intent, world, player, staged_memory, location),
         )
+        outcome_location = self.location_at(world, player.position)
+        self.progression.evaluate(
+            world,
+            player,
+            outcome_location,
+            staged_memory,
+        )
         memory.entries = staged_memory.entries
         outcome = TurnOutcome(
             success=check.success if check is not None else None,
@@ -1105,7 +930,6 @@ class WorldEngine:
             narration="",
             choices=choices,
         )
-        outcome_location = self.location_at(world, player.position)
         outcome_npc = self.scene_service.active_npc(
             world,
             self.npc_at(outcome_location, world),
@@ -1171,6 +995,8 @@ class WorldEngine:
             lambda effect: (
                 self.scene_service.replay_effect(effect, world, player)
                 if self.scene_service.owns_effect(effect)
+                else self.progression.replay_effect(effect, world, player)
+                if self.progression.owns_effect(effect)
                 else self.turn_effects.commit(
                     effect,
                     record.intent,
@@ -1495,6 +1321,10 @@ class WorldEngine:
         cause: str,
     ) -> None:
         world.tick += 1
+        if world.campaign_status in self.progression.TERMINAL_STATUSES:
+            self._refresh_alerts(world, player)
+            self.scene_service.refresh_actions(world)
+            return
         if self.random.random() < 0.35:
             world.weather = self.random.choice(
                 ["Cold drizzle", "Harsh sunlight", "Crosswind", "Quiet fog", "Distant thunder"]
@@ -1519,6 +1349,12 @@ class WorldEngine:
             world.stability = min(100, world.stability + 1)
         elif cause == "explore":
             world.stability = max(35, world.stability - self.random.randint(0, 1))
+        self.progression.evaluate(
+            world,
+            player,
+            active_location,
+            memory,
+        )
         self._refresh_alerts(world, player)
         self.scene_service.refresh_actions(world)
 

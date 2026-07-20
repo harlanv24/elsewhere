@@ -631,14 +631,15 @@ def _llm_system_prompt() -> str:
         "Treat biomes and coordinates as an abstract scene scaffold; reinterpret them through the theme instead of mentioning terrain when it does not fit. Keep summaries and hooks to one short sentence. "
         "For narration tasks, write two to five concise sentences grounded in current state and matching the theme's tone. Favor playable information, voice, and choices over lore exposition. Do not decide dice outcomes or mutate engine-owned resources. "
         "Treat context.world.quests and context.world.clocks as the campaign spine. Drive the active quest's current_stage forward instead of replacing it with a tangent. "
-        "Use progress_summary for concrete evidence, commitments, discoveries, or consequences worth recording. quest_progress_delta is 0 for color, 1 for meaningful progress, and 2 for major progress. Set complete_current_stage only when the scene satisfies the current stage. "
-        "Use facts_discovered for short stable fact IDs or exact factual statements revealed by this beat; the engine validates quest conditions against committed facts. "
+        "Quest stages advance only when their typed current_stage conditions are true; progress counters and complete_current_stage are never authoritative. "
+        "Use progress_summary for concrete evidence or consequences worth recording. Use exact target IDs from the current stage when proposing facts_discovered, npc_disposition_changes, or choices_committed. "
+        "Use facts_discovered for stable fact IDs, npc_disposition_changes only for exact NPC IDs, and choices_committed only for an explicit player commitment. The engine validates each against current state. "
         "Use clock_effects only for existing clock IDs. Positive deltas worsen pressure; negative deltas reduce pressure. follow_up_hook is only a loose thread or rumor. "
         "Offer two to four short choices for most action, exploration, and dialogue beats. Choices should be concrete player actions. "
         "Request mechanical_request and difficulty for uncertainty: exploration_check for search, traversal, lore, hazards; social_check for persuasion, deception, intimidation, insight, negotiation; combat_check for violence, chases under threat, and direct physical danger. "
         "For dialogue, reply in character to player_dialogue, match the theme's style and social rules, use conversation history as authoritative state, avoid repeated prior NPC replies, and move stalled conversations toward a decision or action. "
         "For interpret_freeform_action, describe neutral stakes rather than an outcome, select a check only when uncertainty matters, and propose typed effects against state_ledger and visible_scene_objects. Never propose encounter lifecycle effects. "
-        "Use scene_object_add for newly revealed objects, inventory_add only for a visible portable object the player explicitly takes, inventory_remove only for a carried item explicitly used or consumed, object_status only for the targeted object, location_transition only for an explicit travel action and an exact location ID from context, and clock_delta only for existing clocks. Director-proposed mutations must use the success condition when a check is requested. "
+        "Use scene_object_add for newly revealed objects, inventory_add only for a visible portable object the player explicitly takes, inventory_remove only for a carried item explicitly used or consumed, object_status only for the targeted object, location_transition only for an explicit travel action and an exact location ID from context, npc_disposition only for a current-stage NPC ID, choice_commit only for a current-stage choice ID, and clock_delta only for existing clocks. Director-proposed mutations must use the success condition when a check is requested. "
         "For narrate_turn_outcome, resolved_turn is authoritative. Mention the actual success or failure and only accepted effects. Never narrate a rejected effect, reroll, or invent an additional state change. "
         "Do not reintroduce objects marked removed, destroyed, or in_inventory. "
         "Treat player_inventory_details as concrete carried props and mention them when relevant to the scene. "
@@ -664,6 +665,19 @@ def _intent_from_beat(intent_id: str, action: str, beat: DirectorBeat, world: Wo
     effects.extend(
         StateEffect(kind=EffectKind.FACT_DISCOVERED, target_id=fact)
         for fact in beat.facts_discovered
+    )
+    effects.extend(
+        StateEffect(
+            kind=EffectKind.NPC_DISPOSITION,
+            target_id=change.get("npc_id"),
+            value=change.get("disposition"),
+        )
+        for change in beat.npc_disposition_changes
+        if change.get("npc_id") and change.get("disposition")
+    )
+    effects.extend(
+        StateEffect(kind=EffectKind.CHOICE_COMMIT, target_id=choice_id)
+        for choice_id in beat.choices_committed
     )
     if beat.quest_progress_delta or beat.complete_current_stage or beat.facts_discovered:
         effects.append(

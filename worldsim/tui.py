@@ -19,13 +19,12 @@ from textual.widgets import Button, Input, RichLog, Static
 from textual.widgets._content_switcher import ContentSwitcher
 from textual.widgets._tabbed_content import TabPane, TabbedContent
 
-from worldsim import area
 from worldsim.command_input import normalize_command_input
 from worldsim.debug import DebugLogger
 from worldsim.director import director_from_env
 from worldsim.engine import WorldEngine
 from worldsim.memory import CampaignMemory, CampaignStore
-from worldsim.models import Biome, Location, Npc, Player, Position, World
+from worldsim.models import Biome, Location, Npc, Player, Position, SceneMode, World
 from worldsim.usage import TokenUsageTracker, UsageTotals, format_tokens
 
 if TYPE_CHECKING:
@@ -61,13 +60,6 @@ class Session:
     transcript: list[str] = field(default_factory=list)
     last_command: str | None = None
     selected_area: str | None = None
-    entered_area: str | None = None
-    entered_area_step: int = 0
-    entered_area_tension: int = 0
-    entered_area_theme: str | None = None
-    entered_area_hazard: str | None = None
-    entered_area_npc: str | None = None
-    area_exit_open: bool = False
 
 
 def _partial_json_string_field(text: str, field: str) -> str | None:
@@ -482,10 +474,7 @@ class WorldSimApp(App[None]):
         if button_id.startswith("action-"):
             command = button_id.replace("action-", "", 1)
             self._append_transcript(f"> {command}")
-            if self.session and self.session.entered_area is not None:
-                self._handle_area_action(command)
-            else:
-                self._handle_command(command)
+            self._handle_command(command)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "adventure-command-input":
@@ -627,12 +616,6 @@ class WorldSimApp(App[None]):
             last_message="Campaign restored from local save. The director is rebuilding context from memory.",
             transcript=["System: Campaign restored from local save."],
             selected_area=None,
-            entered_area=None,
-            entered_area_step=0,
-            entered_area_tension=0,
-            entered_area_theme=None,
-            entered_area_hazard=None,
-            entered_area_npc=None,
         )
         self._center_camera_on_player()
         self.query_one("#switcher", ContentSwitcher).current = "game-screen"
@@ -752,12 +735,6 @@ class WorldSimApp(App[None]):
             last_message=last_message,
             transcript=[f"DM: {last_message}"],
             selected_area=None,
-            entered_area=None,
-            entered_area_step=0,
-            entered_area_tension=0,
-            entered_area_theme=None,
-            entered_area_hazard=None,
-            entered_area_npc=None,
         )
         self.call_from_thread(self._finish_new_campaign, session)
 
@@ -963,7 +940,6 @@ class WorldSimApp(App[None]):
             return
         self._sync_usage_totals(self.session.world)
         self.session.last_message = result.message
-        self._update_area_exit_state()
         self._append_transcript(f"DM: {result.message}")
         self.store.save(self.session.world, self.session.player, self.session.memory)
         if self.follow_player:
@@ -1038,7 +1014,7 @@ class WorldSimApp(App[None]):
         player = self.session.player
         memory = self.session.memory
         location = self.engine.location_at(world, player.position)
-        npc = self.engine.npc_at(location, world)
+        npc = self.engine.active_npc(world, player)
         self._sync_area_state(location)
 
         self.query_one("#topbar", Static).update(
@@ -1200,8 +1176,9 @@ class WorldSimApp(App[None]):
         alerts = list(world.alerts)
         if world.active_quest:
             alerts.insert(0, f"Quest: {world.active_quest}")
-        if world.movement_lock:
-            alerts.insert(0, f"Movement locked: {world.movement_lock}")
+        movement_lock = self.engine.movement_lock_reason(world)
+        if movement_lock:
+            alerts.insert(0, f"Movement locked: {movement_lock}")
         if world.last_roll:
             alerts.append(world.last_roll)
         return "\n".join(f"- {alert}" for alert in alerts) or "No immediate alerts."
@@ -1568,6 +1545,8 @@ class WorldSimApp(App[None]):
     def _areas_text(self, location: Location | None) -> str:
         assert self.session is not None
         player = self.session.player
+        scene = self.session.world.active_scene
+        entered_area = scene.area_name if scene is not None and scene.mode == SceneMode.LOCAL else None
         lines = [
             f"Rowan Position: {player.position.x},{player.position.y}" if player.name == "Rowan" else f"{player.name} Position: {player.position.x},{player.position.y}",
             f"Current Terrain: {self.engine.biome_at(self.session.world, player.position).value}",
@@ -1577,9 +1556,9 @@ class WorldSimApp(App[None]):
         else:
             lines.append("Current Region: Unmapped scene")
         lines.append(f"Selected Area: {self._display_area(self.session.selected_area)}")
-        lines.append(f"Entered Area: {self._display_area(self.session.entered_area)}")
+        lines.append(f"Entered Area: {self._display_area(entered_area)}")
         lines.append("")
-        lines.append("Selecting or entering an area does not advance time.")
+        lines.append("Selection is UI-only; entering or moving through an area advances time.")
         return self._wrap_paragraphs("\n".join(lines), 34)
 
     def _local_text(self, location: Location | None, npc: Npc | None, memory: CampaignMemory) -> str:
@@ -1589,10 +1568,11 @@ class WorldSimApp(App[None]):
         scope = location.name if location is not None else None
         memory_lines = memory.relevant_context(world, player, scope, limit=3)
         lines = []
-        if self.session.entered_area is not None:
+        scene = world.active_scene
+        if scene is not None and scene.mode == SceneMode.LOCAL:
             lines.extend(
                 [
-                    f"[bold #f8d774]Entered Area:[/] [bold #67e8f9]{escape(self._display_area(self.session.entered_area))}[/]",
+                    f"[bold #f8d774]Entered Area:[/] [bold #67e8f9]{escape(self._display_area(scene.area_name))}[/]",
                     f"[dim]{escape(self._area_scene_text(location))}[/]",
                     "",
                 ]
@@ -1898,8 +1878,6 @@ class WorldSimApp(App[None]):
         self.area_choices = self._area_choices(location)
         if self.session.selected_area not in self.area_choices:
             self.session.selected_area = self.area_choices[0] if self.area_choices else None
-        if self.session.entered_area not in self.area_choices:
-            self.session.entered_area = None
 
     def _refresh_area_buttons(self) -> None:
         for index in range(3):
@@ -1920,12 +1898,15 @@ class WorldSimApp(App[None]):
         forward_button = self.query_one("#area-forward", Button)
         back_button = self.query_one("#area-back", Button)
         try_leave_button = self.query_one("#area-try-leave", Button)
-        locked = self.session.world.movement_lock is not None
-        enter_button.disabled = locked or self.session.selected_area is None or self.session.entered_area == self.session.selected_area
-        leave_button.disabled = self.session.entered_area is None
-        forward_button.disabled = locked or self.session.entered_area is None or self.session.entered_area_step >= 2
-        back_button.disabled = locked or self.session.entered_area is None or self.session.entered_area_step <= 0
-        try_leave_button.disabled = self.session.entered_area is None
+        world = self.session.world
+        scene = world.active_scene
+        local = scene is not None and scene.mode == SceneMode.LOCAL
+        locked = self.engine.movement_lock_reason(world) is not None
+        enter_button.disabled = locked or self.session.selected_area is None or local
+        leave_button.disabled = not local
+        forward_button.disabled = locked or not local or scene.step >= 2
+        back_button.disabled = locked or not local or scene.step <= 0
+        try_leave_button.disabled = not local
 
     def _refresh_choice_buttons(self) -> None:
         assert self.session is not None
@@ -1949,7 +1930,7 @@ class WorldSimApp(App[None]):
             return
         choice = choices[index]
         self._append_transcript(f"> {choice}")
-        if self.session.entered_area is not None:
+        if self.engine.is_local_scene(self.session.world):
             self._handle_area_choice(choice)
         else:
             self._handle_command(choice)
@@ -1968,113 +1949,43 @@ class WorldSimApp(App[None]):
     def _enter_selected_area(self) -> None:
         if self.session is None or self.session.selected_area is None:
             return
-        self.session.entered_area = self.session.selected_area
-        self.session.entered_area_step = 0
-        self.session.entered_area_tension = self._initial_area_tension()
-        self.session.entered_area_theme = self._area_theme()
-        self.session.entered_area_hazard = self._area_hazard()
-        self.session.entered_area_npc = self._area_npc()
-        self.session.area_exit_open = False
-        self.session.last_message = f"You enter {self.session.entered_area}."
-        self._append_transcript(f"System: {self.session.last_message}")
-        self._refresh_ui()
+        self._append_transcript(f"> enter area {self.session.selected_area}")
+        self._handle_command(f"enter area {self.session.selected_area}")
 
     def _leave_area(self) -> None:
-        if self.session is None or self.session.entered_area is None:
-            return
-        area_name = self.session.entered_area
-        self._step_out_of_location()
-        self.session.entered_area = None
-        self.session.entered_area_step = 0
-        self.session.entered_area_tension = 0
-        self.session.entered_area_theme = None
-        self.session.entered_area_hazard = None
-        self.session.entered_area_npc = None
-        self.session.area_exit_open = False
-        self.session.last_message = f"You leave {area_name} and step back onto the map."
-        self._append_transcript(f"System: {self.session.last_message}")
-        self._refresh_ui()
-
-    def _step_out_of_location(self) -> None:
         if self.session is None:
             return
-        world = self.session.world
-        player = self.session.player
-        current_location = self.engine.location_at(world, player.position)
-        offsets = [(0, -1), (1, 0), (0, 1), (-1, 0), (1, -1), (1, 1), (-1, 1), (-1, -1)]
-        for dx, dy in offsets:
-            candidate = Position(player.position.x + dx, player.position.y + dy)
-            if not (0 <= candidate.x < world.width and 0 <= candidate.y < world.height):
-                continue
-            if not self.engine.passable(world, candidate):
-                continue
-            candidate_location = self.engine.location_at(world, candidate)
-            if current_location is not None and candidate_location is not None and candidate_location.name == current_location.name:
-                continue
-            player.position = candidate
-            return
+        self._append_transcript("> leave area")
+        self._handle_command("leave area")
 
     def _area_choices(self, location: Location | None) -> list[str]:
         assert self.session is not None
-        biome = self.engine.biome_at(self.session.world, self.session.player.position)
-        return area.area_choices(location, biome)
-
-    def _wilderness_areas(self) -> list[str]:
-        assert self.session is not None
-        biome = self.engine.biome_at(self.session.world, self.session.player.position)
-        return area.wilderness_areas(biome)
+        return self.engine.available_areas(self.session.world, self.session.player)
 
     def _display_area(self, area_name: str | None) -> str:
-        return area.display_area(area_name)
+        return area_name if area_name is not None else "None"
 
     def _area_scene_text(self, location: Location | None) -> str:
         assert self.session is not None
-        return area.scene_text(
-            location,
-            self.session.entered_area,
-            self.session.entered_area_step,
-            self.session.entered_area_theme,
-            self.session.entered_area_hazard,
-            self.session.entered_area_npc,
-        )
+        return self.engine.scene_description(self.session.world, self.session.player)
 
     def _move_within_area(self, delta: int) -> None:
-        if self.session is None or self.session.entered_area is None:
+        if self.session is None:
             return
-        self.session.entered_area_step = max(0, min(2, self.session.entered_area_step + delta))
-        if delta > 0:
-            self.session.entered_area_tension = min(9, self.session.entered_area_tension + 1)
-            self.session.last_message = f"You push deeper into {self.session.entered_area}."
-        else:
-            self.session.last_message = f"You pull back toward the edge of {self.session.entered_area}."
-        self._append_transcript(f"System: {self.session.last_message}")
-        self._refresh_ui()
+        command = "push deeper" if delta > 0 else "pull back"
+        self._append_transcript(f"> {command}")
+        self._handle_command(command)
 
     def _try_leave_area(self) -> None:
-        if self.session is None or self.session.entered_area is None:
-            return
-        difficulty = self.session.entered_area_tension + self.session.entered_area_step
-        roll = self.engine.random.randint(1, 10)
-        if roll >= difficulty:
-            self._leave_area()
-            return
-        self.session.last_message = (
-            f"The way out of {self.session.entered_area} tightens. "
-            f"{self.session.entered_area_hazard or 'The place itself'} keeps you committed for now."
-        )
-        self.session.entered_area_tension = min(9, self.session.entered_area_tension + 1)
-        self._append_transcript(f"DM: {self.session.last_message}")
-        self._refresh_ui()
-
-    def _last_roll_succeeded(self) -> bool:
         if self.session is None:
-            return False
-        last_roll = self.session.world.last_roll or ""
-        return "-> success" in last_roll.lower()
+            return
+        self._append_transcript("> force exit")
+        self._handle_command("force exit")
 
     def _visible_choice_labels(self, location: Location | None) -> list[str]:
         assert self.session is not None
-        if self.session.entered_area is None:
+        scene = self.session.world.active_scene
+        if scene is None or scene.mode != SceneMode.LOCAL:
             visible = self._scene_object_choice_labels(location)
             current = [choice for choice in self.session.world.current_choices if not self._is_generic_choice(choice)]
             fallback = [choice for choice in self.session.world.current_choices if self._is_generic_choice(choice)]
@@ -2087,7 +1998,7 @@ class WorldSimApp(App[None]):
                 if len(merged) >= 4:
                     break
             return merged
-        area_choices = self._area_choice_labels(location)
+        area_choices = list(scene.available_actions)
         scene_choices = self._scene_object_choice_labels(location)
         merged: list[str] = []
         filtered_current = [choice for choice in self.session.world.current_choices if not self._is_generic_choice(choice)]
@@ -2141,104 +2052,38 @@ class WorldSimApp(App[None]):
 
     def _area_choice_labels(self, location: Location | None) -> list[str]:
         assert self.session is not None
-        choices: list[str] = []
-        if self.session.area_exit_open or (self._last_roll_succeeded() and self.session.world.movement_lock is None):
-            choices.append("leave area")
-        else:
-            choices.append("force the exit")
-        if self.session.entered_area_step < 2:
-            choices.append("push deeper")
-        elif self.session.entered_area_step > 0:
-            choices.append("pull back")
-        choices.append("inspect the scene")
-        if self.session.entered_area_npc is not None:
-            choices.append("talk")
-        elif location is not None and location.danger > 0:
-            choices.append("press the advantage")
-        else:
-            choices.append("reassess")
-        return choices
-
-    def _update_area_exit_state(self) -> None:
-        if self.session is None or self.session.entered_area is None:
-            return
-        if self.session.world.movement_lock is not None:
-            self.session.area_exit_open = False
-            return
-        if self._last_roll_succeeded():
-            self.session.area_exit_open = True
+        scene = self.session.world.active_scene
+        if scene is None or scene.mode != SceneMode.LOCAL:
+            return []
+        return list(scene.available_actions)
 
     def _handle_area_choice(self, choice: str) -> None:
         cleaned = " ".join(choice.lower().split())
         if cleaned == "leave area":
-            if self.session is not None and (self.session.area_exit_open or self.session.world.movement_lock is None):
-                self._leave_area()
-            else:
-                self._try_leave_area()
+            self._handle_command("leave area")
             return
         if cleaned == "force the exit":
-            self._try_leave_area()
+            self._handle_command("force exit")
             return
         if cleaned == "push deeper":
-            self._move_within_area(1)
+            self._handle_command("push deeper")
             return
         if cleaned == "pull back":
-            self._move_within_area(-1)
+            self._handle_command("pull back")
             return
         if cleaned in {"inspect the scene", "search carefully", "look around"}:
-            self._handle_area_action("look")
+            self._handle_command("look")
             return
         if cleaned == "talk":
-            self._handle_area_action("talk")
+            self._handle_command("talk")
             return
         if cleaned == "press the advantage":
             self._handle_command("attack")
             return
         if cleaned == "reassess":
-            self._handle_area_action("look")
+            self._handle_command("look")
             return
         self._handle_command(choice)
-
-    def _handle_area_action(self, command: str) -> None:
-        if self.session is None:
-            return
-        if command == "look":
-            self.session.last_message = self._area_scene_text(self.engine.location_at(self.session.world, self.session.player.position))
-            self._append_transcript(f"DM: {self.session.last_message}")
-            self._refresh_ui()
-            return
-        if command == "talk" and self.session.entered_area_npc is None:
-            self.session.last_message = "No one answers. The area only returns weather, structure, and tension."
-            self._append_transcript(f"DM: {self.session.last_message}")
-            self._refresh_ui()
-            return
-        self._handle_command(command)
-
-    def _area_zone_name(self) -> str:
-        assert self.session is not None
-        return area.zone_name(self.session.entered_area_step)
-
-    def _initial_area_tension(self) -> int:
-        assert self.session is not None
-        location = self.engine.location_at(self.session.world, self.session.player.position)
-        return area.initial_tension(location)
-
-    def _area_theme(self) -> str:
-        assert self.session is not None
-        biome = self.engine.biome_at(self.session.world, self.session.player.position)
-        return area.area_theme(biome)
-
-    def _area_hazard(self) -> str:
-        assert self.session is not None
-        biome = self.engine.biome_at(self.session.world, self.session.player.position)
-        return area.area_hazard(biome, self._area_hash())
-
-    def _area_npc(self) -> str | None:
-        return area.area_npc(self._area_hash())
-
-    def _area_hash(self) -> int:
-        assert self.session is not None
-        return area.stable_area_hash(self.session.world.seed, self.session.selected_area, self.session.entered_area)
 
     def _has_neighbor(self, world: World, x: int, y: int, biome: Biome) -> bool:
         for dy in (-1, 0, 1):

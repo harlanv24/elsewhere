@@ -153,7 +153,7 @@ def test_narrated_movement_cannot_change_authoritative_location(game_state) -> N
         narration="You cross the city and arrive inside the Observatory.",
     )
 
-    resolve(state, "walk to the observatory")
+    resolve(state, "search the market for clues")
 
     assert state.player.position == position_before
     assert state.engine.location_at(state.world, state.player.position).id == "location-market"

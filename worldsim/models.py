@@ -32,6 +32,11 @@ class EncounterStatus(str, Enum):
     ESCAPED = "escaped"
 
 
+class SceneMode(str, Enum):
+    OVERWORLD = "overworld"
+    LOCAL = "local"
+
+
 class ConditionKind(str, Enum):
     ITEM_ACQUIRED = "item_acquired"
     NPC_RECRUITED = "npc_recruited"
@@ -75,6 +80,11 @@ class EffectKind(str, Enum):
     ENCOUNTER_RESOLVE = "encounter_resolve"
     ENCOUNTER_ESCAPE = "encounter_escape"
     ENCOUNTER_START = "encounter_start"
+    SCENE_ENTER = "scene_enter"
+    SCENE_EXIT = "scene_exit"
+    SCENE_STEP = "scene_step"
+    SCENE_TENSION = "scene_tension"
+    LOCATION_TRANSITION = "location_transition"
 
 
 class EffectCondition(str, Enum):
@@ -191,8 +201,11 @@ class SceneState:
     """Persistent engine-owned state for the player's current scene."""
 
     id: str
+    mode: SceneMode = SceneMode.OVERWORLD
     location_id: str | None = None
+    parent_scene_id: str | None = None
     area_name: str | None = None
+    entered_tick: int | None = None
     step: int = 0
     tension: int = 0
     theme: str | None = None

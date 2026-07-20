@@ -23,8 +23,9 @@ That keeps the game coherent while still allowing an LLM to improvise.
 - A `MockDirector` that behaves like a local DM
 - A `Director` interface where a real LLM backend can be plugged in later
 - Optional local LLM director using JSON prompts and OpenAI-compatible chat completions
-- Versioned campaign saves with migrations from schema versions 0 and 1
-- Persisted, replayable turn records for freeform actions
+- Versioned campaign saves with migrations from schema versions 0, 1, and 2
+- Persisted, replayable turn records for freeform and local-scene actions
+- Engine-owned local scenes, depth, tension, hazards, exits, and dialogue state
 - Deterministic pytest regression coverage for state safety and turn resolution
 
 ## Run
@@ -40,6 +41,10 @@ python3 main.py
 - `move north`
 - `look`
 - `explore`
+- `enter area <name>`
+- `leave area`
+- `push deeper` / `pull back`
+- `force exit`
 - `talk`
 - `say <message>`
 - `attack`
@@ -80,6 +85,11 @@ leading slash.
 
 - Focused freeform-effect preparation, legality policy, and commit handlers
 
+`worldsim/scenes.py`
+
+- Persistent overworld/local-scene transitions
+- Engine-owned local movement, exit checks, available actions, and replay
+
 `worldsim/director.py`
 
 - `Director` base class
@@ -99,7 +109,7 @@ leading slash.
 
 `worldsim/area.py`
 
-- Area choice, hazard, theme, and scene helpers used by the TUI
+- Deterministic area choice, hazard, theme, and scene-description helpers
 
 `worldsim/memory.py`
 
@@ -156,10 +166,11 @@ The engine then:
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
 
-The architecture is currently in a phased migration. Phase 2 now supplies the
-unified intent-to-check-to-reducer-to-outcome-to-narration pipeline for
-freeform actions. Explicit commands remain compatible through the typed check
-adapter; moving persistent area state into the pipeline remains Phase 3 work. See
+The architecture is currently in a phased migration. Phase 3 now keeps local
+scene state in the engine, routes local movement and exits through persisted
+turns, derives locks from encounters, and supports validated stable-ID travel
+between named locations. Quest lifecycle and campaign endings remain Phase 4.
+See
 [`docs/architecture-audit.md`](docs/architecture-audit.md) for the verified
 baseline findings, ownership model, phase gates, and compatibility risks.
 
@@ -256,12 +267,12 @@ The System tab shows the exact debug log path for the current session.
 
 ## Save Schema
 
-`data/campaign.json` now includes `schema_version: 2`. Existing saves without a
-version are treated as version 0; schema version 1 saves are also migrated in
-memory when loaded. The migrations backfill stable location/NPC IDs, persistent
-scene state, a structured encounter for legacy combat locks, and an empty turn
-history where one did not exist. The next save writes version 2. Saves from a
-newer unsupported schema fail with an explicit error instead of being misread.
+`data/campaign.json` now includes `schema_version: 3`. Existing saves without a
+version are treated as version 0; schema versions 1 and 2 are also migrated in
+memory when loaded. The migrations backfill stable location/NPC IDs, structured
+encounters, turn history, and local-scene lifecycle fields. The next save writes
+version 3. Saves from a newer unsupported schema fail with an explicit error
+instead of being misread.
 
 Both `campaign.json` and the debug `state.json` mirror are written through a
 temporary file followed by atomic replacement.
@@ -276,10 +287,10 @@ python -m pytest
 python -m compileall -q main.py worldsim tests
 ```
 
-The deterministic suite covers the Phase 1 safety boundary plus Phase 2
-pre-roll/post-roll ordering, transactional rollback, successful and failed door
-effects, persisted turn records, replay without rerolling, explicit-command
-compatibility, and save migration/round-tripping.
+The deterministic suite covers the Phase 1 safety boundary, Phase 2 turn
+resolution, and Phase 3 local-scene persistence, common d20 exits, alternate
+encounter escape, dialogue lifecycle, derived actions, named-location travel,
+replay without rerolling, and save migration/round-tripping.
 
 When debugging a live LLM turn, compare:
 

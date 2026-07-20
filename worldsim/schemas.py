@@ -240,6 +240,10 @@ ACTION_INTENT_SCHEMA: dict[str, object] = {
                                 EffectKind.ENCOUNTER_RESOLVE,
                                 EffectKind.ENCOUNTER_ESCAPE,
                                 EffectKind.ENCOUNTER_START,
+                                EffectKind.SCENE_ENTER,
+                                EffectKind.SCENE_EXIT,
+                                EffectKind.SCENE_STEP,
+                                EffectKind.SCENE_TENSION,
                             }
                         ],
                     },
@@ -285,6 +289,7 @@ def director_context(
             "locations": [
                 {
                     "index": index,
+                    "id": location.id,
                     "name": location.name,
                     "biome": location.biome.value,
                     "danger": location.danger,
@@ -296,6 +301,7 @@ def director_context(
             "npcs": [
                 {
                     "index": index,
+                    "id": npc.id,
                     "name": npc.name,
                     "role": npc.role,
                     "disposition": npc.disposition,
@@ -642,6 +648,7 @@ def _player_payload(player: Player) -> dict[str, object]:
 
 def _location_payload(location: Location) -> dict[str, object]:
     return {
+        "id": location.id,
         "name": location.name,
         "position": {"x": location.position.x, "y": location.position.y},
         "biome": location.biome.value,
@@ -652,6 +659,7 @@ def _location_payload(location: Location) -> dict[str, object]:
 
 def _npc_payload(npc: Npc) -> dict[str, object]:
     return {
+        "id": npc.id,
         "name": npc.name,
         "role": npc.role,
         "disposition": npc.disposition,
@@ -718,8 +726,11 @@ def _scene_payload(world: World) -> dict[str, object] | None:
         return None
     return {
         "id": scene.id,
+        "mode": scene.mode.value,
         "location_id": scene.location_id,
+        "parent_scene_id": scene.parent_scene_id,
         "area_name": scene.area_name,
+        "entered_tick": scene.entered_tick,
         "step": scene.step,
         "tension": scene.tension,
         "theme": scene.theme,

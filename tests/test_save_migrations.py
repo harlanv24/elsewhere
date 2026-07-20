@@ -5,15 +5,18 @@ import json
 import pytest
 
 from worldsim.memory import CampaignStore, SAVE_SCHEMA_VERSION, UnsupportedSaveVersion
-from worldsim.models import DialogueState, EncounterState, EncounterStatus, SceneState
+from worldsim.models import DialogueState, EncounterState, EncounterStatus, SceneMode, SceneState
 
 
 def test_save_load_preserves_active_scene_encounter_dialogue_and_entity_ids(game_state, tmp_path) -> None:
     state = game_state
     state.world.active_scene = SceneState(
         id="scene:market-cellar",
+        mode=SceneMode.LOCAL,
         location_id="location-market",
+        parent_scene_id="scene:location-market",
         area_name="Market Cellar",
+        entered_tick=state.world.tick,
         step=2,
         tension=7,
         theme="tight stone passages",
@@ -118,3 +121,34 @@ def test_version_one_save_migrates_with_empty_turn_history(game_state, tmp_path)
     assert loaded is not None
     migrated_world, _, _ = loaded
     assert migrated_world.turn_records == []
+
+
+def test_version_two_save_migrates_local_scene_lifecycle_fields(game_state, tmp_path) -> None:
+    state = game_state
+    state.world.active_scene = SceneState(
+        id="scene:market-cellar",
+        mode=SceneMode.LOCAL,
+        location_id="location-market",
+        parent_scene_id="scene:location-market",
+        area_name="Market Cellar",
+        entered_tick=state.world.tick,
+        step=1,
+        tension=4,
+    )
+    store = CampaignStore(tmp_path / "campaign.json")
+    store.save(state.world, state.player, state.memory)
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 2
+    scene = payload["world"]["active_scene"]
+    scene.pop("mode")
+    scene.pop("parent_scene_id")
+    scene.pop("entered_tick")
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = store.load()
+
+    assert loaded is not None
+    migrated_world, _, _ = loaded
+    assert migrated_world.active_scene is not None
+    assert migrated_world.active_scene.mode == SceneMode.LOCAL
+    assert migrated_world.active_scene.area_name == "Market Cellar"

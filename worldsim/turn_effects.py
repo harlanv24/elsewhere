@@ -15,6 +15,7 @@ from worldsim.models import (
     Location,
     Player,
     RejectedEffect,
+    SceneMode,
     StateEffect,
     World,
 )
@@ -31,6 +32,16 @@ class TurnEffectService:
 
     def prepare(self, intent: ActionIntent, world: World) -> list[StateEffect]:
         effects = list(intent.proposed_effects)
+        if not any(effect.kind == EffectKind.LOCATION_TRANSITION for effect in effects):
+            destination = self._requested_location_transition(intent.raw_input, world)
+            if destination is not None:
+                effects.append(
+                    StateEffect(
+                        kind=EffectKind.LOCATION_TRANSITION,
+                        target_id=destination.id,
+                        source=EffectSource.ENGINE,
+                    )
+                )
         targeted = self.engine._targeted_object_action(intent.raw_input)
         if targeted is not None:
             verb, target = targeted
@@ -116,6 +127,25 @@ class TurnEffectService:
             and effect.source != EffectSource.ENGINE
         ):
             return "encounter lifecycle effects are engine-owned"
+        if effect.kind in {
+            EffectKind.SCENE_ENTER,
+            EffectKind.SCENE_EXIT,
+            EffectKind.SCENE_STEP,
+            EffectKind.SCENE_TENSION,
+        }:
+            return "scene lifecycle effects are engine-owned"
+        if (
+            any(item.kind == EffectKind.LOCATION_TRANSITION for item in intent.proposed_effects)
+            and effect.kind
+            in {
+                EffectKind.SCENE_OBJECT_ADD,
+                EffectKind.SCENE_OBJECT_REMOVE,
+                EffectKind.INVENTORY_ADD,
+                EffectKind.INVENTORY_REMOVE,
+                EffectKind.OBJECT_STATUS,
+            }
+        ):
+            return "travel turns cannot also mutate scene objects or inventory"
         if effect.kind == EffectKind.SCENE_OBJECT_ADD:
             if not target:
                 return "scene object name is empty"
@@ -186,6 +216,22 @@ class TurnEffectService:
         elif effect.kind in {EffectKind.ENCOUNTER_RESOLVE, EffectKind.ENCOUNTER_ESCAPE}:
             if world.active_encounter is None or not world.active_encounter.movement_locked:
                 return "there is no active encounter to resolve"
+        elif effect.kind == EffectKind.LOCATION_TRANSITION:
+            destination = next(
+                (location for location in world.locations if location.id == effect.target_id),
+                None,
+            )
+            if destination is None:
+                return "destination location ID is unknown"
+            if not self._is_travel_action(intent.raw_input):
+                return "location transition does not match a travel action"
+            if world.active_scene is not None and world.active_scene.mode == SceneMode.LOCAL:
+                return "leave the local scene before traveling"
+            if world.active_encounter is not None and world.active_encounter.movement_locked:
+                return "an active encounter prevents travel"
+            current = self.engine.location_at(world, player.position)
+            if current is not None and current.id == destination.id:
+                return "the player is already at that location"
         return None
 
     def commit(
@@ -273,6 +319,13 @@ class TurnEffectService:
             )
         elif effect.kind == EffectKind.ENCOUNTER_START:
             self.engine._start_encounter(world, player, location, effect.value or "Survive the threat.")
+        elif effect.kind == EffectKind.LOCATION_TRANSITION:
+            destination = next(
+                location for location in world.locations if location.id == effect.target_id
+            )
+            player.position = destination.position
+            world.dialogue_state = None
+            self.engine.scene_service.sync(world, player, destination)
 
     def summarize(
         self,
@@ -294,3 +347,27 @@ class TurnEffectService:
         if rejected:
             base += f" Rejected {len(rejected)} proposed effect(s)."
         return base
+
+    def _requested_location_transition(self, action: str, world: World) -> Location | None:
+        if not self._is_travel_action(action):
+            return None
+        normalized = " ".join(action.casefold().split())
+        matches = [
+            location
+            for location in world.locations
+            if " ".join(location.name.casefold().split()) in normalized
+        ]
+        return max(matches, key=lambda location: len(location.name), default=None)
+
+    def _is_travel_action(self, action: str) -> bool:
+        normalized = " ".join(action.casefold().split())
+        verbs = (
+            "travel to ",
+            "go to ",
+            "walk to ",
+            "head to ",
+            "journey to ",
+            "return to ",
+            "move to ",
+        )
+        return any(normalized.startswith(verb) for verb in verbs)

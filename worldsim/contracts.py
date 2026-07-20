@@ -118,7 +118,8 @@ TASK_CONTRACTS: dict[str, TaskContract] = {
         "interpret_freeform_action",
         "Interpret neutral intent and stakes before resolution. Propose only "
         "typed effects grounded in the state ledger, exact IDs, and explicit "
-        "player action.",
+        "player action. Location transitions may target only destination IDs "
+        "listed in available_routes.",
         _schema(
             ACTION_INTENT_SCHEMA,
             "FreeformActionIntent",

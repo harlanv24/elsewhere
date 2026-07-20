@@ -251,13 +251,33 @@ class TurnEffectService:
                 return "destination location ID is unknown"
             if not self._is_travel_action(intent.raw_input):
                 return "location transition does not match a travel action"
+            requested_destination = self._requested_location_transition(
+                intent.raw_input,
+                world,
+            )
+            if (
+                requested_destination is None
+                or requested_destination.id != destination.id
+            ):
+                return "destination ID does not match the named travel target"
             if world.active_scene is not None and world.active_scene.mode == SceneMode.LOCAL:
                 return "leave the local scene before traveling"
             if world.active_encounter is not None and world.active_encounter.movement_locked:
                 return "an active encounter prevents travel"
             current = self.engine.location_at(world, player.position)
+            if current is None:
+                return "named travel must begin at a named location"
             if current is not None and current.id == destination.id:
                 return "the player is already at that location"
+            if (
+                self.engine.navigation.route_between(
+                    world,
+                    current.id,
+                    destination.id,
+                )
+                is None
+            ):
+                return "the destination is not directly connected by a route"
         return None
 
     def commit(

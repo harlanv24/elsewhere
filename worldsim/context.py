@@ -173,6 +173,7 @@ class ContextSelector:
             "encounter": self._encounter_payload(world),
             "active_quest": self._quest_payload(active_quest),
             "applicable_clocks": self._applicable_clocks(world, active_quest),
+            "available_routes": self._available_routes(world, location),
             "relevant_locations": [
                 self._location_payload(item) for item in relevant_locations
             ],
@@ -249,6 +250,7 @@ class ContextSelector:
             "encounter",
             "active_quest",
             "applicable_clocks",
+            "available_routes",
             "memory_context",
         }
         additions = {
@@ -418,6 +420,37 @@ class ContextSelector:
                 }
             )
         return selected[:3]
+
+    def _available_routes(
+        self,
+        world: World,
+        location: Location | None,
+    ) -> list[dict[str, object]]:
+        if location is None:
+            return []
+        locations_by_id = {
+            item.id: item
+            for item in world.locations
+        }
+        available: list[dict[str, object]] = []
+        for route in world.routes:
+            destination_id = route.other(location.id)
+            destination = locations_by_id.get(destination_id or "")
+            if destination is None:
+                continue
+            available.append(
+                {
+                    "route_id": route.id,
+                    "destination_id": destination.id,
+                    "destination_name": destination.name,
+                    "kind": route.kind,
+                    "danger": route.danger,
+                }
+            )
+        return sorted(
+            available,
+            key=lambda item: str(item["destination_id"]),
+        )[:6]
 
     def _player_payload(
         self,
@@ -697,6 +730,7 @@ class ContextSelector:
             ("relevant_npcs",),
             ("relevant_locations",),
             ("applicable_clocks",),
+            ("available_routes",),
             ("dialogue_history",),
             ("state_ledger", "recent_state_facts"),
             ("state_ledger", "discovered_facts"),
@@ -876,12 +910,15 @@ class ContextSelector:
             "check_kind",
             "command",
             "condition",
+            "destination_id",
+            "destination_name",
             "id",
             "kind",
             "location_id",
             "name",
             "npc_id",
             "player_dialogue",
+            "route_id",
             "status",
             "target_id",
             "task",

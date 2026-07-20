@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import textwrap
 
+from worldsim.ascii_render import AsciiRenderer
 from worldsim.engine import WorldEngine
 from worldsim.memory import CampaignMemory
-from worldsim.models import Biome, Player, Position, World
+from worldsim.models import Player, SceneMode, World
 
 
 def render_dashboard(
@@ -47,11 +48,13 @@ def render_dashboard(
     log_panel = _panel("SIMULATION LOG", event_lines, left_width, 10)
 
     if active_location is not None:
+        route_names = _route_names(world, engine, active_location.id)
         selected_region_lines = [
             active_location.name,
             active_location.summary,
             f"Terrain: {active_location.biome.value}",
             f"Danger Rating: {active_location.danger}/9",
+            "Routes: " + (", ".join(route_names) or "none"),
         ]
     else:
         selected_region_lines = [
@@ -84,25 +87,35 @@ def render_dashboard(
 
 
 def _render_map(world: World, player: Player) -> list[str]:
-    lines: list[str] = []
-    location_positions = {location.position: location.name[0].upper() for location in world.locations}
-    for y in range(world.height):
-        chars: list[str] = []
-        for x in range(world.width):
-            pos = Position(x, y)
-            if pos == player.position:
-                chars.append("@")
-            elif pos in location_positions:
-                chars.append(location_positions[pos])
-            else:
-                biome = world.tiles[y][x]
-                chars.append(_tile_glyph(biome))
-        lines.append("".join(chars))
-    return lines
-
-
-def _tile_glyph(biome: Biome) -> str:
-    return biome.glyph
+    renderer = AsciiRenderer()
+    if (
+        world.active_scene is not None
+        and world.active_scene.mode == SceneMode.LOCAL
+    ):
+        return renderer.compose_local(world, player, 29, 14).plain_lines()
+    composition = renderer.compose_overworld(world, player)
+    view_width = min(29, world.width)
+    view_height = min(14, world.height)
+    start_x = max(
+        0,
+        min(
+            player.position.x - view_width // 2,
+            world.width - view_width,
+        ),
+    )
+    start_y = max(
+        0,
+        min(
+            player.position.y - view_height // 2,
+            world.height - view_height,
+        ),
+    )
+    return composition.plain_lines(
+        start_x,
+        start_y,
+        view_width,
+        view_height,
+    )
 
 
 def _player_lines(player: Player) -> list[str]:
@@ -123,10 +136,30 @@ def _summary_lines(world: World, engine: WorldEngine) -> list[str]:
         f"Campaign: {world.campaign_status.value}",
         f"Age: {world.tick} turns",
         f"Locations: {counts['locations']}",
+        f"Routes: {counts['routes']}",
         f"NPCs: {counts['npcs']}",
         f"Events tracked: {counts['events']}",
         f"Hooks: {counts['hooks']}",
         f"Stability: {world.stability}%",
+    ]
+
+
+def _route_names(
+    world: World,
+    engine: WorldEngine,
+    location_id: str,
+) -> list[str]:
+    locations = {
+        location.id: location.name
+        for location in world.locations
+    }
+    return [
+        locations[destination_id]
+        for destination_id in engine.navigation.neighbor_ids(
+            world,
+            location_id,
+        )
+        if destination_id in locations
     ]
 
 

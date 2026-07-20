@@ -28,11 +28,11 @@ from worldsim.models import (
     Position,
     Quest,
     QuestClock,
-    SceneState,
     TurnOutcome,
     TurnRecord,
     World,
 )
+from worldsim.scenes import SceneService
 from worldsim.turn_effects import TurnEffectService
 from worldsim.turn_resolution import StateReducer
 
@@ -43,6 +43,7 @@ class WorldEngine:
         self.random = random.Random(self.seed)
         self.state_reducer = StateReducer()
         self.turn_effects = TurnEffectService(self)
+        self.scene_service = SceneService(self)
 
     def create_world(self, director: Director | None = None, theme_prompt: str | None = None) -> World:
         width = 96
@@ -118,7 +119,18 @@ class WorldEngine:
                 return CommandResult("You are not in an active conversation.")
             world.dialogue_state.active = False
             world.dialogue_state = None
+            self.scene_service.refresh_actions(world)
             return CommandResult("You end the conversation.")
+
+        scene_result = self.scene_service.resolve(
+            raw_command,
+            world,
+            player,
+            director,
+            memory,
+        )
+        if scene_result is not None:
+            return scene_result
 
         if text in {"flee", "retreat", "withdraw"}:
             if self._movement_lock_reason(world) is None:
@@ -131,10 +143,12 @@ class WorldEngine:
 
         if text == "help":
             return CommandResult(
-                "Commands: north south east west, look, explore, talk, say <message>, end conversation, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare prose is dialogue; quit, help, inventory, and end conversation remain global commands, and other commands can be prefixed with /."
+                "Commands: north south east west, look, explore, enter area <name>, leave area, push deeper, pull back, force exit, talk, say <message>, end conversation, attack, rest, wait, inventory, inspect <item>, use <item>, drop <item>, take <item>, help, quit. The DM may request exploration, social, or combat checks; the engine rolls them using class and item bonuses. While speaking with an NPC, bare prose is dialogue; quit, help, inventory, and end conversation remain global commands, and other commands can be prefixed with /."
             )
 
         if text in {"north", "south", "east", "west", "n", "s", "e", "w"} or text.startswith("move "):
+            if self.scene_service.is_local(world):
+                return CommandResult("Leave the local area before traveling across the overworld.")
             movement_lock = self._movement_lock_reason(world)
             if movement_lock is not None:
                 return CommandResult(
@@ -167,7 +181,7 @@ class WorldEngine:
             return CommandResult(f"{result.message} {description}", advance_time=True)
 
         location = self.location_at(world, player.position)
-        npc = self.npc_at(location, world)
+        npc = self.scene_service.active_npc(world, self.npc_at(location, world))
         memory_context = memory.relevant_context(world, player, location.name if location else None)
 
         if text in {"inventory", "inv", "items"}:
@@ -454,21 +468,7 @@ class WorldEngine:
 
     def _sync_scene(self, world: World, player: Player) -> None:
         location = self.location_at(world, player.position)
-        location_id = location.id if location is not None else None
-        scene_id = (
-            f"scene:{location_id}"
-            if location_id is not None
-            else f"scene:{player.position.x},{player.position.y}"
-        )
-        if world.active_scene is None or world.active_scene.id != scene_id:
-            world.active_scene = SceneState(
-                id=scene_id,
-                location_id=location_id,
-                available_actions=list(world.current_choices),
-            )
-        else:
-            world.active_scene.location_id = location_id
-            world.active_scene.available_actions = list(world.current_choices)
+        self.scene_service.sync(world, player, location)
 
     def _ensure_legacy_encounter(self, world: World) -> None:
         encounter = world.active_encounter
@@ -503,7 +503,12 @@ class WorldEngine:
         encounter = world.active_encounter
         if encounter is not None and encounter.movement_locked:
             return f"encounter {encounter.id} is active"
-        return world.movement_lock
+        return None
+
+    def movement_lock_reason(self, world: World) -> str | None:
+        """Return the encounter-derived movement lock, if any."""
+
+        return self._movement_lock_reason(world)
 
     def _start_encounter(
         self,
@@ -513,7 +518,7 @@ class WorldEngine:
         objective: str,
     ) -> None:
         if world.active_encounter is None or not world.active_encounter.movement_locked:
-            npc = self.npc_at(location, world)
+            npc = self.scene_service.active_npc(world, self.npc_at(location, world))
             participants = [player.name]
             if npc is not None:
                 participants.append(npc.id or npc.name)
@@ -557,6 +562,19 @@ class WorldEngine:
 
     def passable(self, world: World, position: Position) -> bool:
         return world.tiles[position.y][position.x] != Biome.WATER
+
+    def available_areas(self, world: World, player: Player) -> list[str]:
+        return self.scene_service.available_areas(world, player)
+
+    def scene_description(self, world: World, player: Player) -> str:
+        return self.scene_service.describe(world, self.location_at(world, player.position))
+
+    def is_local_scene(self, world: World) -> bool:
+        return self.scene_service.is_local(world)
+
+    def active_npc(self, world: World, player: Player) -> Npc | None:
+        location = self.location_at(world, player.position)
+        return self.scene_service.active_npc(world, self.npc_at(location, world))
 
     def player_bonus(self, player: Player, check_kind: str | None = None) -> int:
         bonus = {"warrior": 4, "rogue": 3, "mage": 2, "ranger": 3}.get(player.archetype, 2)
@@ -1087,11 +1105,16 @@ class WorldEngine:
             narration="",
             choices=choices,
         )
+        outcome_location = self.location_at(world, player.position)
+        outcome_npc = self.scene_service.active_npc(
+            world,
+            self.npc_at(outcome_location, world),
+        )
         narration = director.narrate_turn_outcome(
             world,
             player,
-            self.location_at(world, player.position),
-            npc,
+            outcome_location,
+            outcome_npc,
             record,
             memory_context,
         )
@@ -1145,15 +1168,21 @@ class WorldEngine:
             world,
             player,
             record.outcome.accepted_effects,
-            lambda effect: self.turn_effects.commit(
-                effect,
-                record.intent,
-                world,
-                player,
-                CampaignMemory(),
-                self.location_at(world, player.position),
+            lambda effect: (
+                self.scene_service.replay_effect(effect, world, player)
+                if self.scene_service.owns_effect(effect)
+                else self.turn_effects.commit(
+                    effect,
+                    record.intent,
+                    world,
+                    player,
+                    CampaignMemory(),
+                    self.location_at(world, player.position),
+                )
             ),
         )
+        world.current_choices = list(record.choices)
+        self.scene_service.refresh_actions(world)
 
     def _requested_take_item(self, action: str) -> str | None:
         words = action.strip().split(maxsplit=1)
@@ -1310,6 +1339,9 @@ class WorldEngine:
         line = f"[tick {tick}] {normalized}"
         world.state_facts.append(line)
         del world.state_facts[:-limit]
+
+    def remember_state_fact(self, world: World, fact: str, tick: int) -> None:
+        self._remember_state_fact(world, fact, tick)
 
     def _dialogue_history(self, world: World, npc: Npc, limit: int = 8) -> list[str]:
         return world.conversations.get(npc.name, [])[-limit:]
@@ -1488,6 +1520,17 @@ class WorldEngine:
         elif cause == "explore":
             world.stability = max(35, world.stability - self.random.randint(0, 1))
         self._refresh_alerts(world, player)
+        self.scene_service.refresh_actions(world)
+
+    def advance_world(
+        self,
+        world: World,
+        player: Player,
+        director: Director,
+        memory: CampaignMemory,
+        cause: str,
+    ) -> None:
+        self._advance_world(world, player, director, memory, cause)
 
     def _refresh_alerts(self, world: World, player: Player | None) -> None:
         alerts: list[str] = []
@@ -1630,6 +1673,15 @@ class WorldEngine:
         except ValueError:
             kind = CheckKind.GENERIC
         return self._resolve_check(world, player, difficulty, kind).success
+
+    def resolve_typed_check(
+        self,
+        world: World,
+        player: Player,
+        difficulty: int,
+        check_kind: CheckKind,
+    ) -> CheckResult:
+        return self._resolve_check(world, player, difficulty, check_kind)
 
     def _resolve_check(
         self,

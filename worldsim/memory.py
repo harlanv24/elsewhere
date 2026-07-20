@@ -30,6 +30,7 @@ from worldsim.models import (
     Quest,
     QuestClock,
     RejectedEffect,
+    SceneMode,
     SceneState,
     StateEffect,
     TurnOutcome,
@@ -40,7 +41,7 @@ from worldsim.schemas import turn_record_to_payload
 from worldsim.usage import UsageTotals
 
 
-SAVE_SCHEMA_VERSION = 2
+SAVE_SCHEMA_VERSION = 3
 
 
 class UnsupportedSaveVersion(ValueError):
@@ -395,6 +396,9 @@ class CampaignStore:
         if version == 1:
             payload = self._migrate_v1_to_v2(payload)
             version = 2
+        if version == 2:
+            payload = self._migrate_v2_to_v3(payload)
+            version = 3
         if version != SAVE_SCHEMA_VERSION:
             raise UnsupportedSaveVersion(f"No migration path from campaign save version {version}.")
         return payload
@@ -494,6 +498,21 @@ class CampaignStore:
             raise ValueError("Version 1 campaign save must contain a world object.")
         world.setdefault("turn_records", [])
         payload["schema_version"] = 2
+        return payload
+
+    def _migrate_v2_to_v3(self, payload: dict[str, object]) -> dict[str, object]:
+        world = payload.get("world")
+        if not isinstance(world, dict):
+            raise ValueError("Version 2 campaign save must contain a world object.")
+        scene = world.get("active_scene")
+        if isinstance(scene, dict):
+            scene.setdefault(
+                "mode",
+                SceneMode.LOCAL.value if scene.get("area_name") else SceneMode.OVERWORLD.value,
+            )
+            scene.setdefault("parent_scene_id", None)
+            scene.setdefault("entered_tick", None)
+        payload["schema_version"] = 3
         return payload
 
     def _serialize_quest(self, quest: Quest) -> dict[str, object]:
@@ -681,15 +700,28 @@ class CampaignStore:
         )
 
     def _serialize_scene(self, scene: SceneState | None) -> dict[str, object] | None:
-        return asdict(scene) if scene is not None else None
+        if scene is None:
+            return None
+        payload = asdict(scene)
+        payload["mode"] = scene.mode.value
+        return payload
 
     def _deserialize_scene(self, payload: object) -> SceneState | None:
         if not isinstance(payload, dict):
             return None
+        try:
+            mode = SceneMode(str(payload.get("mode", SceneMode.OVERWORLD.value)))
+        except ValueError:
+            mode = SceneMode.LOCAL if payload.get("area_name") else SceneMode.OVERWORLD
         return SceneState(
             id=str(payload.get("id", "scene:unknown")),
+            mode=mode,
             location_id=payload.get("location_id") if isinstance(payload.get("location_id"), str) else None,
+            parent_scene_id=payload.get("parent_scene_id")
+            if isinstance(payload.get("parent_scene_id"), str)
+            else None,
             area_name=payload.get("area_name") if isinstance(payload.get("area_name"), str) else None,
+            entered_tick=int(payload["entered_tick"]) if isinstance(payload.get("entered_tick"), int) else None,
             step=int(payload.get("step", 0)),
             tension=int(payload.get("tension", 0)),
             theme=payload.get("theme") if isinstance(payload.get("theme"), str) else None,

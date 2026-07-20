@@ -23,6 +23,8 @@ That keeps the game coherent while still allowing an LLM to improvise.
 - A `MockDirector` that behaves like a local DM
 - A `Director` interface where a real LLM backend can be plugged in later
 - Optional local LLM director using JSON prompts and OpenAI-compatible chat completions
+- Versioned campaign saves with migration from the original unversioned format
+- Deterministic pytest regression coverage for state safety
 
 ## Run
 
@@ -44,14 +46,20 @@ python3 main.py
 - `wait`
 - `help`
 - `quit`
+- `end conversation`
 
-You can also type freeform actions, such as `take journal`, `read the inscription`, or `open the rusted box`. The director narrates the attempt, while the engine decides what inventory or world state changes are allowed.
+You can also type freeform actions, such as `take journal`, `read the inscription`, or `open the rusted box`. The director proposes the attempt and effects. When a check is required, Phase 1 now commits inventory and scene effects only after an engine-owned success.
+
+During an active conversation, bare prose is dialogue. Global commands such as
+`quit`, `help`, `inventory`, and `end conversation` remain commands without a
+leading slash.
 
 ## Architecture
 
 `worldsim/models.py`
 
-- Game state, locations, events, NPCs, and director responses
+- Game state, locations, events, NPCs, director responses, persistent scenes,
+  encounters, dialogue state, quest conditions, and clock triggers
 
 `worldsim/engine.py`
 
@@ -83,7 +91,7 @@ You can also type freeform actions, such as `take journal`, `read the inscriptio
 `worldsim/memory.py`
 
 - Compact long-term memory store
-- Local save/load for campaign state
+- Versioned local save/load with version-0 migration and atomic replacement
 - Retrieval of relevant memories for the director layer
 
 `worldsim/tui.py`
@@ -122,6 +130,12 @@ The engine then decides:
 - how the world state changes
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
+
+The architecture is currently in a phased migration. Phase 1 supplies the
+safety boundary and compatibility models; the unified intent → check → reducer
+→ outcome → narration pipeline remains Phase 2 work. See
+[`docs/architecture-audit.md`](docs/architecture-audit.md) for the verified
+baseline findings, ownership model, phase gates, and compatibility risks.
 
 The demo uses an OpenAI-compatible chat completions endpoint. If `OPENAI_API_KEY`
 or `WORLDSIM_LLM_API_KEY` is set and `WORLDSIM_LLM_BASE_URL` is not set, it uses
@@ -213,3 +227,37 @@ Each app run writes a new JSONL file under `data/debug`. These logs include:
 The System tab shows the exact debug log path for the current session.
 
 `data/state.json` is a compact mirror of the current campaign state intended for debugging and LLM context inspection. It includes current visible objects, object status records such as `in_inventory` or `destroyed`, recent state facts, inventory, and recent conversations.
+
+## Save Schema
+
+`data/campaign.json` now includes `schema_version: 1`. Existing saves without a
+version are treated as version 0 and migrated in memory when loaded. Migration
+backfills stable location/NPC IDs, persistent scene state, and a structured
+encounter for legacy combat locks. The next save writes version 1. Saves from a
+newer unsupported schema fail with an explicit error instead of being
+misread.
+
+Both `campaign.json` and the debug `state.json` mirror are written through a
+temporary file followed by atomic replacement.
+
+## Testing and Debugging
+
+Install runtime and test dependencies, then run:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest
+python -m compileall -q main.py worldsim tests
+```
+
+The Phase 1 suite uses deterministic seeds and covers failed-effect rollback,
+encounter escape cleanup, dialogue command routing, structured dialogue quest
+evidence, narrative/location authority, clock consequences, quest completion
+validation, and save migration/round-tripping.
+
+When debugging a live LLM turn, compare:
+
+1. `data/debug/session-*.jsonl` for prompts, streamed responses, parsed payloads,
+   and fallback errors;
+2. `data/state.json` for the latest authoritative state mirror;
+3. `data/campaign.json` for the versioned persistent campaign.

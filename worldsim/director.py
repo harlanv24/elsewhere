@@ -6,6 +6,14 @@ import random
 from abc import ABC, abstractmethod
 from typing import Callable
 
+from worldsim.context import ContextMetrics, ContextSelector
+from worldsim.contracts import (
+    SchemaValidationError,
+    contract_for,
+    repair_system_prompt,
+    task_system_prompt,
+    validate_payload,
+)
 from worldsim.debug import DebugLogger
 from worldsim.llm_client import LLMClient, LLMClientError
 from worldsim.models import (
@@ -21,13 +29,8 @@ from worldsim.models import (
     World,
 )
 from worldsim.schemas import (
-    ACTION_INTENT_SCHEMA,
-    DIRECTOR_BEAT_SCHEMA,
-    TEXT_RESPONSE_SCHEMA,
-    WORLD_DETAILS_SCHEMA,
     action_intent_from_payload,
     director_beat_from_payload,
-    director_context,
     parse_json_object,
     text_from_payload,
     world_details_from_payload,
@@ -360,14 +363,35 @@ class MockDirector(Director):
 class LocalLLMDirector(Director):
     """Director backed by a local OpenAI-compatible chat completions server."""
 
-    def __init__(self, client: LLMClient, fallback: Director, debug_logger: DebugLogger | None = None) -> None:
+    def __init__(
+        self,
+        client: LLMClient,
+        fallback: Director,
+        debug_logger: DebugLogger | None = None,
+        context_selector: ContextSelector | None = None,
+        repair_attempts: int | None = None,
+    ) -> None:
         self.client = client
         self.fallback = fallback
         self.debug_logger = debug_logger
+        self.context_selector = context_selector or ContextSelector()
+        if repair_attempts is None:
+            try:
+                configured_repairs = int(
+                    os.getenv("WORLDSIM_LLM_REPAIR_ATTEMPTS", "1")
+                )
+            except ValueError:
+                configured_repairs = 1
+        else:
+            configured_repairs = repair_attempts
+        self.repair_attempts = max(0, min(2, configured_repairs))
         self.last_error: str | None = None
         self.last_task: str | None = None
         self.last_used_fallback = False
         self.last_payload: dict[str, object] | None = None
+        self.last_context_metrics: ContextMetrics | None = None
+        self.context_metrics: list[ContextMetrics] = []
+        self.last_repair_count = 0
         self.on_stream_delta: Callable[[str], None] | None = None
 
     @property
@@ -376,11 +400,22 @@ class LocalLLMDirector(Director):
         if self.last_error:
             return f"LLM director: fallback after {self.last_task or 'request'} failed ({self.last_error})"
         auth = "API key present" if config.api_key else "no API key"
-        return f"LLM director: {config.model} at {config.base_url} ({auth})"
+        context = (
+            f", context {self.last_context_metrics.estimated_tokens}/"
+            f"{self.last_context_metrics.budget_tokens} est. tokens"
+            if self.last_context_metrics is not None
+            else ""
+        )
+        return f"LLM director: {config.model} at {config.base_url} ({auth}{context})"
 
     def introduce_world(self, world: World, player: Player, memory_context: list[str] | None = None) -> str:
-        context = director_context(world, player=player, memory_context=memory_context)
         try:
+            context = self._context(
+                "introduce_world",
+                world,
+                player=player,
+                memory_context=memory_context,
+            )
             return self._request_text("introduce_world", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("introduce_world", exc)
@@ -394,8 +429,15 @@ class LocalLLMDirector(Director):
         npc: Npc | None,
         memory_context: list[str] | None = None,
     ) -> str:
-        context = director_context(world, player=player, location=location, npc=npc, memory_context=memory_context)
         try:
+            context = self._context(
+                "describe_location",
+                world,
+                player=player,
+                location=location,
+                npc=npc,
+                memory_context=memory_context,
+            )
             return self._request_text("describe_location", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("describe_location", exc)
@@ -410,23 +452,24 @@ class LocalLLMDirector(Director):
         npc: Npc | None,
         memory_context: list[str] | None = None,
     ) -> DirectorBeat:
-        context = director_context(
-            world,
-            player=player,
-            location=location,
-            npc=npc,
-            memory_context=memory_context,
-            action=action,
-        )
         try:
+            context = self._context(
+                "respond_to_action",
+                world,
+                player=player,
+                location=location,
+                npc=npc,
+                memory_context=memory_context,
+                action=action,
+            )
             return self._request_beat("respond_to_action", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("respond_to_action", exc)
             return self.fallback.respond_to_action(world, player, action, location, npc, memory_context)
 
     def ambient_world_event(self, world: World) -> str:
-        context = director_context(world)
         try:
+            context = self._context("ambient_world_event", world)
             return self._request_text("ambient_world_event", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("ambient_world_event", exc)
@@ -441,15 +484,16 @@ class LocalLLMDirector(Director):
         npc: Npc | None,
         memory_context: list[str] | None = None,
     ) -> DirectorBeat:
-        context = director_context(
-            world,
-            player=player,
-            location=location,
-            npc=npc,
-            memory_context=memory_context,
-            action=action,
-        )
         try:
+            context = self._context(
+                "respond_to_freeform_action",
+                world,
+                player=player,
+                location=location,
+                npc=npc,
+                memory_context=memory_context,
+                action=action,
+            )
             return self._request_beat("respond_to_freeform_action", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("respond_to_freeform_action", exc)
@@ -465,16 +509,17 @@ class LocalLLMDirector(Director):
         intent_id: str,
         memory_context: list[str] | None = None,
     ) -> ActionIntent:
-        context = director_context(
-            world,
-            player=player,
-            location=location,
-            npc=npc,
-            memory_context=memory_context,
-            action=action,
-        )
         try:
-            payload = self._request_json("interpret_freeform_action", context, ACTION_INTENT_SCHEMA)
+            context = self._context(
+                "interpret_freeform_action",
+                world,
+                player=player,
+                location=location,
+                npc=npc,
+                memory_context=memory_context,
+                action=action,
+            )
+            payload = self._request_json("interpret_freeform_action", context)
             return action_intent_from_payload(payload, intent_id, action)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("interpret_freeform_action", exc)
@@ -497,16 +542,17 @@ class LocalLLMDirector(Director):
         record: TurnRecord,
         memory_context: list[str] | None = None,
     ) -> str:
-        context = director_context(
-            world,
-            player=player,
-            location=location,
-            npc=npc,
-            memory_context=memory_context,
-            action=record.command,
-            turn_record=record,
-        )
         try:
+            context = self._context(
+                "narrate_turn_outcome",
+                world,
+                player=player,
+                location=location,
+                npc=npc,
+                memory_context=memory_context,
+                action=record.command,
+                turn_record=record,
+            )
             return self._request_text("narrate_turn_outcome", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("narrate_turn_outcome", exc)
@@ -529,16 +575,17 @@ class LocalLLMDirector(Director):
         memory_context: list[str] | None = None,
         dialogue_history: list[str] | None = None,
     ) -> DirectorBeat | str:
-        context = director_context(
-            world,
-            player=player,
-            location=location,
-            npc=npc,
-            memory_context=memory_context,
-            player_dialogue=player_dialogue,
-            dialogue_history=dialogue_history,
-        )
         try:
+            context = self._context(
+                "respond_to_dialogue",
+                world,
+                player=player,
+                location=location,
+                npc=npc,
+                memory_context=memory_context,
+                player_dialogue=player_dialogue,
+                dialogue_history=dialogue_history,
+            )
             return self._request_beat("respond_to_dialogue", context)
         except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
             self._record_fallback("respond_to_dialogue", exc)
@@ -553,9 +600,9 @@ class LocalLLMDirector(Director):
             )
 
     def generate_world_details(self, world: World) -> dict[str, object] | None:
-        context = _world_generation_context(world)
         try:
-            payload = self._request_json("generate_world_details", context, WORLD_DETAILS_SCHEMA)
+            context = self._context("generate_world_details", world)
+            payload = self._request_json("generate_world_details", context)
             details = world_details_from_payload(payload)
             if not details.get("locations") and not details.get("quest_hooks"):
                 raise ValueError("World details response did not include usable locations or hooks.")
@@ -565,40 +612,139 @@ class LocalLLMDirector(Director):
             return None
 
     def _request_text(self, task: str, context: dict[str, object]) -> str:
-        payload = self._request_json(task, context, TEXT_RESPONSE_SCHEMA)
+        payload = self._request_json(task, context)
         return text_from_payload(payload)
 
     def _request_beat(self, task: str, context: dict[str, object]) -> DirectorBeat:
-        payload = self._request_json(task, context, DIRECTOR_BEAT_SCHEMA)
+        payload = self._request_json(task, context)
         return director_beat_from_payload(payload)
 
     def _request_json(
         self,
         task: str,
         context: dict[str, object],
-        response_schema: dict[str, object],
     ) -> dict[str, object]:
+        contract = contract_for(task)
+        schema = contract.schema
         user_payload = {
             "task": task,
             "context": context,
-            "response_schema": response_schema,
+            "response_schema": schema,
         }
-        user = json.dumps(user_payload, indent=2)
-        self._log("director_prompt", task=task, system=_llm_system_prompt(), user_payload=user_payload)
+        system = task_system_prompt(task, LLM_ENGINE_CONTRACT)
+        user = json.dumps(user_payload, separators=(",", ":"), ensure_ascii=False)
+        self._log(
+            "director_prompt",
+            task=task,
+            system=system,
+            user_payload=user_payload,
+        )
+        self.last_repair_count = 0
         raw = self.client.complete_streaming(
-            _llm_system_prompt(),
+            system,
             user,
             self.on_stream_delta,
-            response_schema=response_schema,
+            response_schema=schema,
         )
         self._log("director_raw_response", task=task, raw=raw)
-        payload = parse_json_object(raw)
+        try:
+            payload = validate_payload(parse_json_object(raw), schema)
+        except (SchemaValidationError, ValueError, json.JSONDecodeError) as exc:
+            payload = self._repair_response(
+                task,
+                context,
+                schema,
+                raw,
+                exc,
+            )
         self._log("director_parsed_response", task=task, payload=payload)
         self.last_error = None
         self.last_task = task
         self.last_used_fallback = False
         self.last_payload = payload
         return payload
+
+    def _repair_response(
+        self,
+        task: str,
+        context: dict[str, object],
+        schema: dict[str, object],
+        raw: str,
+        initial_error: Exception,
+    ) -> dict[str, object]:
+        error: Exception = initial_error
+        invalid_response = raw
+        for attempt in range(1, self.repair_attempts + 1):
+            errors = (
+                error.errors
+                if isinstance(error, SchemaValidationError)
+                else [str(error)]
+            )
+            repair_payload = {
+                "task": task,
+                "context": context,
+                "invalid_response": invalid_response[:4000],
+                "validation_errors": errors[:12],
+                "response_schema": schema,
+            }
+            self._log(
+                "director_repair_attempt",
+                task=task,
+                attempt=attempt,
+                validation_errors=errors,
+            )
+            repaired_raw = self.client.complete_streaming(
+                repair_system_prompt(task, LLM_ENGINE_CONTRACT),
+                json.dumps(
+                    repair_payload,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ),
+                None,
+                response_schema=schema,
+            )
+            self.last_repair_count = attempt
+            self._log(
+                "director_repair_response",
+                task=task,
+                attempt=attempt,
+                raw=repaired_raw,
+            )
+            try:
+                return validate_payload(
+                    parse_json_object(repaired_raw),
+                    schema,
+                )
+            except (
+                SchemaValidationError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
+                error = exc
+                invalid_response = repaired_raw
+        raise error
+
+    def _context(
+        self,
+        task: str,
+        world: World,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        selection = self.context_selector.select(task, world, **kwargs)
+        self.last_context_metrics = selection.metrics
+        self.context_metrics.append(selection.metrics)
+        del self.context_metrics[:-100]
+        self._log(
+            "director_context_budget",
+            task=task,
+            estimated_tokens=selection.metrics.estimated_tokens,
+            budget_tokens=selection.metrics.budget_tokens,
+            character_count=selection.metrics.character_count,
+            dropped_items=selection.metrics.dropped_items,
+            truncated_strings=selection.metrics.truncated_strings,
+            within_budget=selection.metrics.within_budget,
+        )
+        return selection.context
 
     def _record_fallback(self, task: str, exc: Exception) -> None:
         self.last_task = task
@@ -617,34 +763,6 @@ def director_from_env(seed: int, debug_logger: DebugLogger | None = None) -> Dir
     if os.getenv("WORLDSIM_DIRECTOR", "llm").lower() != "llm":
         return fallback
     return LocalLLMDirector(LLMClient.from_env(debug_logger), fallback, debug_logger)
-
-
-def _llm_system_prompt() -> str:
-    return (
-        f"{LLM_ENGINE_CONTRACT}\n\n"
-        "Read the JSON task and context from the user message. Return exactly one JSON object matching response_schema. "
-        "Use null for absent optional fields and do not wrap JSON in Markdown. "
-        "For generate_world_details, preserve provided indexes. Use context.theme_prompt to create a compact campaign_title, overarching_quest, weather, opening_event, named locations, NPCs, quest hooks, five or six lower-case player_archetypes with distinctive rollable skill bonuses, five to eight homelands, starting_inventory, and skill_descriptions. Keep worldbuilding terse and playable. "
-        "Player archetypes should not be evenly distributed. Give each one a strong identity: four to eight skills, at least one drawback on most archetypes, rare niche skills, occasional signature +4 bonuses, normal strengths around +1 to +3, and penalties from -1 to -2 where appropriate. "
-        "Starting inventory should be three to five mundane, useful, theme-specific items with short descriptions. Skill descriptions should explain how each generated skill works in this specific theme, not generic adventure wording. "
-        "Infer genre, tone, stakes, social rules, dialogue style, locations, items, class names, and conflicts from theme_prompt. Theme_prompt overrides every default fantasy or frontier assumption. "
-        "Treat biomes and coordinates as an abstract scene scaffold; reinterpret them through the theme instead of mentioning terrain when it does not fit. Keep summaries and hooks to one short sentence. "
-        "For narration tasks, write two to five concise sentences grounded in current state and matching the theme's tone. Favor playable information, voice, and choices over lore exposition. Do not decide dice outcomes or mutate engine-owned resources. "
-        "Treat context.world.quests and context.world.clocks as the campaign spine. Drive the active quest's current_stage forward instead of replacing it with a tangent. "
-        "Quest stages advance only when their typed current_stage conditions are true; progress counters and complete_current_stage are never authoritative. "
-        "Use progress_summary for concrete evidence or consequences worth recording. Use exact target IDs from the current stage when proposing facts_discovered, npc_disposition_changes, or choices_committed. "
-        "Use facts_discovered for stable fact IDs, npc_disposition_changes only for exact NPC IDs, and choices_committed only for an explicit player commitment. The engine validates each against current state. "
-        "Use clock_effects only for existing clock IDs. Positive deltas worsen pressure; negative deltas reduce pressure. follow_up_hook is only a loose thread or rumor. "
-        "Offer two to four short choices for most action, exploration, and dialogue beats. Choices should be concrete player actions. "
-        "Request mechanical_request and difficulty for uncertainty: exploration_check for search, traversal, lore, hazards; social_check for persuasion, deception, intimidation, insight, negotiation; combat_check for violence, chases under threat, and direct physical danger. "
-        "For dialogue, reply in character to player_dialogue, match the theme's style and social rules, use conversation history as authoritative state, avoid repeated prior NPC replies, and move stalled conversations toward a decision or action. "
-        "For interpret_freeform_action, describe neutral stakes rather than an outcome, select a check only when uncertainty matters, and propose typed effects against state_ledger and visible_scene_objects. Never propose encounter lifecycle effects. "
-        "Use scene_object_add for newly revealed objects, inventory_add only for a visible portable object the player explicitly takes, inventory_remove only for a carried item explicitly used or consumed, object_status only for the targeted object, location_transition only for an explicit travel action and an exact location ID from context, npc_disposition only for a current-stage NPC ID, choice_commit only for a current-stage choice ID, and clock_delta only for existing clocks. Director-proposed mutations must use the success condition when a check is requested. "
-        "For narrate_turn_outcome, resolved_turn is authoritative. Mention the actual success or failure and only accepted effects. Never narrate a rejected effect, reroll, or invent an additional state change. "
-        "Do not reintroduce objects marked removed, destroyed, or in_inventory. "
-        "Treat player_inventory_details as concrete carried props and mention them when relevant to the scene. "
-        "Prefer choices that reference actual items, scene objects, and location details instead of generic filler."
-    )
 
 
 def _intent_from_beat(intent_id: str, action: str, beat: DirectorBeat, world: World) -> ActionIntent:
@@ -717,48 +835,3 @@ def _intent_from_beat(intent_id: str, action: str, beat: DirectorBeat, world: Wo
         tags=list(beat.tags),
         choices=list(beat.choices),
     )
-
-
-def _world_generation_context(world: World) -> dict[str, object]:
-    return {
-        "theme_prompt": world.theme_prompt,
-        "world": {
-            "seed": world.seed,
-            "tick": world.tick,
-            "theme_prompt": world.theme_prompt,
-            "stability": world.stability,
-            "map_size": {"width": world.width, "height": world.height},
-            "locations": [
-                {
-                    "index": index,
-                    "biome": location.biome.value,
-                    "danger": location.danger,
-                    "position": {"x": location.position.x, "y": location.position.y},
-                }
-                for index, location in enumerate(world.locations)
-            ],
-            "npc_slots": [
-                {
-                    "index": index,
-                    "location_index": min(index, len(world.locations) - 1),
-                }
-                for index, _ in enumerate(world.npcs)
-            ],
-        },
-        "style": _style_context(world.theme_prompt),
-    }
-
-
-def _style_context(theme_prompt: str) -> dict[str, object]:
-    avoid = ["placeholder names", "generic filler", "ignoring the requested theme"]
-    guidance = [
-        "Infer genre, tone, stakes, dialogue style, social rules, pacing, and naming from theme_prompt.",
-        "The terrain scaffold is abstract; reinterpret it as neighborhoods, rooms, routes, sectors, offices, venues, or other theme-appropriate spaces.",
-        "Do not copy default fantasy language unless theme_prompt asks for it.",
-    ]
-    return {
-        "genre": theme_prompt,
-        "tone": "infer from theme_prompt; keep it playable and concise",
-        "guidance": guidance,
-        "avoid": avoid,
-    }

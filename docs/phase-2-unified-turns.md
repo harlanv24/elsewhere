@@ -35,11 +35,11 @@ their boolean roll API now adapts the same typed `CheckResult` used by freeform
 turns.
 
 Schema version 1 saves migrate to version 2 by adding an empty turn history.
-Unversioned saves still follow the version 0 → 1 → 2 migration chain.
+Phase 3 extends the chain to version 3 with local-scene lifecycle fields.
 
 ## Deferred to later phases
 
-- Persistent TUI area movement and dialogue lifecycle are Phase 3.
+- Persistent TUI area movement and dialogue lifecycle were completed in Phase 3.
 - Fully typed quest lifecycle, finales, and campaign endings are Phase 4.
 - Relevance-budgeted director context and schema repair are Phase 5.
 - Stable game-object records, route graphs, and layered ASCII rendering remain

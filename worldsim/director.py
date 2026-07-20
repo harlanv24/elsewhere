@@ -8,11 +8,24 @@ from typing import Callable
 
 from worldsim.debug import DebugLogger
 from worldsim.llm_client import LLMClient, LLMClientError
-from worldsim.models import DirectorBeat, Location, Npc, Player, World
+from worldsim.models import (
+    ActionIntent,
+    CheckKind,
+    DirectorBeat,
+    EffectKind,
+    Location,
+    Npc,
+    Player,
+    StateEffect,
+    TurnRecord,
+    World,
+)
 from worldsim.schemas import (
+    ACTION_INTENT_SCHEMA,
     DIRECTOR_BEAT_SCHEMA,
     TEXT_RESPONSE_SCHEMA,
     WORLD_DETAILS_SCHEMA,
+    action_intent_from_payload,
     director_beat_from_payload,
     director_context,
     parse_json_object,
@@ -36,19 +49,10 @@ You may not:
 - modify HP, gold, XP, inventory, or map coordinates
 - invalidate the established world state
 
-Return structured beats with:
-- title
-- narration
-- mechanical_request
-- difficulty
-- tags
-- follow_up_hook
-- choices
-- progress_summary
-- quest_progress_delta
-- complete_current_stage
-- clock_effects
-- facts_discovered
+For interpret_freeform_action, return an ActionIntent-shaped proposal without
+claiming whether the attempt succeeds. For narrate_turn_outcome, treat the
+resolved turn, check result, and accepted effects as authoritative and narrate
+only what actually happened.
 """.strip()
 
 
@@ -101,6 +105,42 @@ class Director(ABC):
             narration=f"You try to {action}, but the moment does not clearly change.",
             tags=["freeform"],
         )
+
+    def interpret_freeform_action(
+        self,
+        world: World,
+        player: Player,
+        action: str,
+        location: Location | None,
+        npc: Npc | None,
+        intent_id: str,
+        memory_context: list[str] | None = None,
+    ) -> ActionIntent:
+        """Compatibility adapter for directors that still return DirectorBeat."""
+
+        beat = self.respond_to_freeform_action(world, player, action, location, npc, memory_context)
+        return _intent_from_beat(intent_id, action, beat, world)
+
+    def narrate_turn_outcome(
+        self,
+        world: World,
+        player: Player,
+        location: Location | None,
+        npc: Npc | None,
+        record: TurnRecord,
+        memory_context: list[str] | None = None,
+    ) -> str:
+        """Outcome-aware fallback used by mock and legacy director implementations."""
+
+        del world, location, npc, memory_context
+        if record.outcome.success is True:
+            lead = f"{player.name} succeeds at {record.intent.raw_input}."
+        elif record.outcome.success is False:
+            lead = f"{player.name} attempts to {record.intent.raw_input}, but fails."
+        else:
+            lead = f"{player.name} follows through: {record.intent.raw_input}."
+        summary = record.outcome.authoritative_summary
+        return f"{lead} {summary}".strip()
 
     @abstractmethod
     def respond_to_dialogue(
@@ -415,6 +455,70 @@ class LocalLLMDirector(Director):
             self._record_fallback("respond_to_freeform_action", exc)
             return self.fallback.respond_to_freeform_action(world, player, action, location, npc, memory_context)
 
+    def interpret_freeform_action(
+        self,
+        world: World,
+        player: Player,
+        action: str,
+        location: Location | None,
+        npc: Npc | None,
+        intent_id: str,
+        memory_context: list[str] | None = None,
+    ) -> ActionIntent:
+        context = director_context(
+            world,
+            player=player,
+            location=location,
+            npc=npc,
+            memory_context=memory_context,
+            action=action,
+        )
+        try:
+            payload = self._request_json("interpret_freeform_action", context, ACTION_INTENT_SCHEMA)
+            return action_intent_from_payload(payload, intent_id, action)
+        except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
+            self._record_fallback("interpret_freeform_action", exc)
+            return self.fallback.interpret_freeform_action(
+                world,
+                player,
+                action,
+                location,
+                npc,
+                intent_id,
+                memory_context,
+            )
+
+    def narrate_turn_outcome(
+        self,
+        world: World,
+        player: Player,
+        location: Location | None,
+        npc: Npc | None,
+        record: TurnRecord,
+        memory_context: list[str] | None = None,
+    ) -> str:
+        context = director_context(
+            world,
+            player=player,
+            location=location,
+            npc=npc,
+            memory_context=memory_context,
+            action=record.command,
+            turn_record=record,
+        )
+        try:
+            return self._request_text("narrate_turn_outcome", context)
+        except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
+            self._record_fallback("narrate_turn_outcome", exc)
+            return self.fallback.narrate_turn_outcome(
+                world,
+                player,
+                location,
+                npc,
+                record,
+                memory_context,
+            )
+
     def respond_to_dialogue(
         self,
         world: World,
@@ -533,10 +637,71 @@ def _llm_system_prompt() -> str:
         "Offer two to four short choices for most action, exploration, and dialogue beats. Choices should be concrete player actions. "
         "Request mechanical_request and difficulty for uncertainty: exploration_check for search, traversal, lore, hazards; social_check for persuasion, deception, intimidation, insight, negotiation; combat_check for violence, chases under threat, and direct physical danger. "
         "For dialogue, reply in character to player_dialogue, match the theme's style and social rules, use conversation history as authoritative state, avoid repeated prior NPC replies, and move stalled conversations toward a decision or action. "
-        "For freeform actions, resolve the exact attempted action against state_ledger and visible_scene_objects. Do not reintroduce removed, destroyed, or in_inventory objects. "
+        "For interpret_freeform_action, describe neutral stakes rather than an outcome, select a check only when uncertainty matters, and propose typed effects against state_ledger and visible_scene_objects. Never propose encounter lifecycle effects. "
+        "Use scene_object_add for newly revealed objects, inventory_add only for a visible portable object the player explicitly takes, inventory_remove only for a carried item explicitly used or consumed, object_status only for the targeted object, and clock_delta only for existing clocks. Director-proposed mutations must use the success condition when a check is requested. "
+        "For narrate_turn_outcome, resolved_turn is authoritative. Mention the actual success or failure and only accepted effects. Never narrate a rejected effect, reroll, or invent an additional state change. "
+        "Do not reintroduce objects marked removed, destroyed, or in_inventory. "
         "Treat player_inventory_details as concrete carried props and mention them when relevant to the scene. "
-        "If an action reveals objects, list them in scene_objects. If the player takes a small visible portable object, list it in inventory_add. If the player uses or consumes an inventory item, list it in inventory_remove. "
         "Prefer choices that reference actual items, scene objects, and location details instead of generic filler."
+    )
+
+
+def _intent_from_beat(intent_id: str, action: str, beat: DirectorBeat, world: World) -> ActionIntent:
+    effects = [
+        StateEffect(kind=EffectKind.SCENE_OBJECT_ADD, target_id=item)
+        for item in beat.scene_objects
+    ]
+    effects.extend(
+        StateEffect(kind=EffectKind.INVENTORY_ADD, target_id=item)
+        for item in beat.inventory_add
+    )
+    effects.extend(
+        StateEffect(kind=EffectKind.INVENTORY_REMOVE, target_id=item)
+        for item in beat.inventory_remove
+    )
+    if beat.follow_up_hook:
+        effects.append(StateEffect(kind=EffectKind.QUEST_HOOK_ADD, value=beat.follow_up_hook))
+    effects.extend(
+        StateEffect(kind=EffectKind.FACT_DISCOVERED, target_id=fact)
+        for fact in beat.facts_discovered
+    )
+    if beat.quest_progress_delta or beat.complete_current_stage or beat.facts_discovered:
+        effects.append(
+            StateEffect(
+                kind=EffectKind.QUEST_PROGRESS,
+                target_id=world.active_quest_id,
+                value=beat.progress_summary,
+                amount=beat.quest_progress_delta,
+                flag=beat.complete_current_stage,
+            )
+        )
+    for raw_effect in beat.clock_effects:
+        clock_id = raw_effect.get("clock_id")
+        delta = raw_effect.get("delta")
+        reason = raw_effect.get("reason")
+        if isinstance(clock_id, str) and isinstance(delta, int):
+            effects.append(
+                StateEffect(
+                    kind=EffectKind.CLOCK_DELTA,
+                    target_id=clock_id,
+                    value=reason if isinstance(reason, str) else None,
+                    amount=delta,
+                )
+            )
+    try:
+        check_kind = CheckKind(beat.mechanical_request) if beat.mechanical_request is not None else None
+    except ValueError:
+        check_kind = None
+    return ActionIntent(
+        id=intent_id,
+        raw_input=action,
+        title=beat.title,
+        stakes=beat.narration,
+        check_kind=check_kind,
+        difficulty=beat.difficulty,
+        proposed_effects=effects,
+        tags=list(beat.tags),
+        choices=list(beat.choices),
     )
 
 

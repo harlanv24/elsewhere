@@ -50,6 +50,44 @@ class ClockTriggerKind(str, Enum):
     START_ENCOUNTER = "start_encounter"
 
 
+class ActionKind(str, Enum):
+    FREEFORM = "freeform"
+    EXPLICIT = "explicit"
+
+
+class CheckKind(str, Enum):
+    GENERIC = "check"
+    EXPLORATION = "exploration_check"
+    SOCIAL = "social_check"
+    COMBAT = "combat_check"
+
+
+class EffectKind(str, Enum):
+    SCENE_OBJECT_ADD = "scene_object_add"
+    SCENE_OBJECT_REMOVE = "scene_object_remove"
+    INVENTORY_ADD = "inventory_add"
+    INVENTORY_REMOVE = "inventory_remove"
+    OBJECT_STATUS = "object_status"
+    QUEST_HOOK_ADD = "quest_hook_add"
+    FACT_DISCOVERED = "fact_discovered"
+    QUEST_PROGRESS = "quest_progress"
+    CLOCK_DELTA = "clock_delta"
+    ENCOUNTER_RESOLVE = "encounter_resolve"
+    ENCOUNTER_ESCAPE = "encounter_escape"
+    ENCOUNTER_START = "encounter_start"
+
+
+class EffectCondition(str, Enum):
+    ALWAYS = "always"
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
+class EffectSource(str, Enum):
+    DIRECTOR = "director"
+    ENGINE = "engine"
+
+
 @dataclass(frozen=True)
 class Position:
     x: int
@@ -193,6 +231,82 @@ class DialogueState:
     active: bool = True
 
 
+@dataclass(frozen=True)
+class StateEffect:
+    """A proposed or engine-authored mutation evaluated by the state reducer."""
+
+    kind: EffectKind
+    target_id: str | None = None
+    value: str | None = None
+    amount: int = 0
+    condition: EffectCondition = EffectCondition.SUCCESS
+    flag: bool = False
+    source: EffectSource = EffectSource.DIRECTOR
+
+
+@dataclass(frozen=True)
+class RejectedEffect:
+    effect: StateEffect
+    reason: str
+
+
+@dataclass
+class ActionIntent:
+    """A non-authoritative interpretation of what the player is attempting."""
+
+    id: str
+    raw_input: str
+    kind: ActionKind = ActionKind.FREEFORM
+    title: str = "Improvised Action"
+    stakes: str = ""
+    check_kind: CheckKind | None = None
+    difficulty: int = 10
+    proposed_effects: list[StateEffect] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    choices: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    kind: CheckKind
+    difficulty: int
+    raw_roll: int
+    bonus: int
+    total: int
+    success: bool
+
+    @property
+    def summary(self) -> str:
+        sign = "+" if self.bonus >= 0 else ""
+        verdict = "success" if self.success else "failure"
+        return (
+            f"Roll: {self.kind.value.replace('_', ' ')} vs DC {self.difficulty}: "
+            f"raw d20 {self.raw_roll}, bonus {sign}{self.bonus}, total {self.total} -> {verdict}."
+        )
+
+
+@dataclass
+class TurnOutcome:
+    success: bool | None
+    accepted_effects: list[StateEffect] = field(default_factory=list)
+    rejected_effects: list[RejectedEffect] = field(default_factory=list)
+    authoritative_summary: str = ""
+
+
+@dataclass
+class TurnRecord:
+    """Persisted authoritative record of one resolved turn."""
+
+    id: str
+    tick: int
+    command: str
+    intent: ActionIntent
+    check: CheckResult | None
+    outcome: TurnOutcome
+    narration: str
+    choices: list[str] = field(default_factory=list)
+
+
 @dataclass
 class DirectorBeat:
     title: str
@@ -255,6 +369,7 @@ class World:
     dialogue_state: DialogueState | None = None
     discovered_facts: list[str] = field(default_factory=list)
     committed_choices: list[str] = field(default_factory=list)
+    turn_records: list[TurnRecord] = field(default_factory=list)
 
 
 @dataclass

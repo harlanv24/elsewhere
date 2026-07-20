@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 import random
 import secrets
@@ -7,7 +8,10 @@ import secrets
 from worldsim.director import Director
 from worldsim.memory import CampaignMemory
 from worldsim.models import (
+    ActionIntent,
     Biome,
+    CheckKind,
+    CheckResult,
     ClockTrigger,
     ClockTriggerKind,
     CommandResult,
@@ -25,14 +29,20 @@ from worldsim.models import (
     Quest,
     QuestClock,
     SceneState,
+    TurnOutcome,
+    TurnRecord,
     World,
 )
+from worldsim.turn_effects import TurnEffectService
+from worldsim.turn_resolution import StateReducer
 
 
 class WorldEngine:
     def __init__(self, seed: int | None = None) -> None:
         self.seed = seed if seed is not None else secrets.randbelow(1_000_000_000)
         self.random = random.Random(self.seed)
+        self.state_reducer = StateReducer()
+        self.turn_effects = TurnEffectService(self)
 
     def create_world(self, director: Director | None = None, theme_prompt: str | None = None) -> World:
         width = 96
@@ -1030,104 +1040,120 @@ class WorldEngine:
         unavailable = self._unavailable_target_message(action, world, player.position, visible_items, player.inventory)
         if unavailable is not None:
             return CommandResult(unavailable)
-        beat = director.respond_to_freeform_action(world, player, action, location, npc, memory_context)
-        self._apply_beat_context(world, beat, player, location)
-        success: bool | None = None
-        suffix_parts: list[str] = []
-        if beat.mechanical_request is not None:
-            success = self._roll_check(world, player, beat.difficulty, beat.mechanical_request)
-            suffix_parts.append(world.last_roll or "")
 
-        added: list[str] = []
-        removed_scene_items: list[str] = []
-        if success is not False:
-            self._remember_scene_objects(world, player.position, beat.scene_objects)
-            visible_items = self.scene_objects_at(world, player.position)
-            added = self._apply_inventory_changes(player, world, action, beat, visible_items)
-            removed_scene_items = self._apply_scene_object_action(world, player.position, action, visible_items)
+        turn_id = f"turn-{world.tick:06d}-{len(world.turn_records) + 1:04d}"
+        intent = director.interpret_freeform_action(
+            world,
+            player,
+            action,
+            location,
+            npc,
+            turn_id,
+            memory_context,
+        )
+        intent.id = turn_id
+        intent.raw_input = action
+        intent.proposed_effects = self.turn_effects.prepare(intent, world)
+        check = (
+            self._resolve_check(world, player, intent.difficulty, intent.check_kind)
+            if intent.check_kind is not None
+            else None
+        )
+        staged_memory = deepcopy(memory)
+        accepted, rejected = self.state_reducer.apply(
+            world,
+            player,
+            intent.proposed_effects,
+            check,
+            lambda effect: self.turn_effects.validate(effect, intent, world, player),
+            lambda effect: self.turn_effects.commit(effect, intent, world, player, staged_memory, location),
+        )
+        memory.entries = staged_memory.entries
+        outcome = TurnOutcome(
+            success=check.success if check is not None else None,
+            accepted_effects=accepted,
+            rejected_effects=rejected,
+            authoritative_summary=self.turn_effects.summarize(check, accepted, rejected),
+        )
+        choices, follow_up_prompt = self._turn_choices(intent, check, location, npc)
+        world.current_choices = choices
+        record = TurnRecord(
+            id=turn_id,
+            tick=world.tick,
+            command=action,
+            intent=intent,
+            check=check,
+            outcome=outcome,
+            narration="",
+            choices=choices,
+        )
+        narration = director.narrate_turn_outcome(
+            world,
+            player,
+            self.location_at(world, player.position),
+            npc,
+            record,
+            memory_context,
+        )
+        record.narration = narration
+        world.turn_records.append(record)
+        del world.turn_records[:-100]
 
         place = location.name if location else "the wilds"
-        outcome_parts = [f"attempted `{action}`"]
-        if beat.tags:
-            outcome_parts.append(f"tags: {', '.join(beat.tags[:4])}")
-        if added:
-            outcome_parts.append(f"took: {', '.join(added)}")
-        if removed_scene_items:
-            outcome_parts.append(f"changed/removed: {', '.join(removed_scene_items)}")
-        if beat.follow_up_hook:
-            outcome_parts.append(f"hook: {beat.follow_up_hook}")
-        if success is False:
-            outcome_parts.append("authoritative effects rejected after failed check")
-        self._remember_state_fact(world, f"{player.name} near {place}: {'; '.join(outcome_parts)}.", world.tick)
+        fact = f"{player.name} near {place}: {outcome.authoritative_summary}"
+        self._remember_state_fact(world, fact, world.tick)
         memory.remember(
             "action",
             f"{player.name}:{world.tick}:{action}",
-            f"{player.name} near {place}: {'; '.join(outcome_parts)}.",
+            fact,
             world.tick,
             importance=6,
             tags=[player.name, place, "action"],
         )
-        if added:
-            suffix_parts.append(f"Added to inventory: {', '.join(added)}.")
-        if removed_scene_items:
-            suffix_parts.append(f"Scene changed: {', '.join(removed_scene_items)}.")
-        if beat.mechanical_request is not None:
-            follow_up = self._roll_follow_up(action, success, beat, location, npc)
-            world.current_choices = self._merge_choices(follow_up["choices"], beat.choices)
-            suffix_parts.append(follow_up["prompt"])
-            if success and beat.mechanical_request == "combat_check":
-                self._resolve_active_encounter(world, EncounterStatus.RESOLVED, "The hostile encounter was overcome.")
-            elif success and beat.mechanical_request == "exploration_check":
-                encounter = world.active_encounter
-                if encounter is not None and encounter.movement_locked:
-                    self._resolve_active_encounter(
-                        world,
-                        EncounterStatus.ESCAPED,
-                        "A successful exploration action found a route out.",
-                    )
-            elif not success and beat.mechanical_request == "combat_check":
-                self._start_encounter(world, player, location, "Survive or overcome the hostile threat.")
-        self._apply_progression(world, player, beat, memory, location, success)
         self._advance_world(world, player, director, memory, "freeform")
         memory.remember_world_state(world, player)
+        suffix_parts = [check.summary] if check is not None else []
+        if follow_up_prompt:
+            suffix_parts.append(follow_up_prompt)
         suffix = f"\n\n{' '.join(suffix_parts)}" if suffix_parts else ""
-        return CommandResult(f"{beat.narration}{suffix}", advance_time=True)
+        return CommandResult(f"{narration}{suffix}", advance_time=True)
 
-    def _apply_inventory_changes(
+    def _turn_choices(
         self,
-        player: Player,
-        world: World,
-        action: str,
-        beat: DirectorBeat,
-        visible_items: list[str],
-    ) -> list[str]:
-        requested_item = self._requested_take_item(action)
-        proposed_adds = list(beat.inventory_add)
-        if requested_item and self._matches_known_object(requested_item, visible_items):
-            proposed_adds.insert(0, requested_item)
-        added: list[str] = []
-        for item in proposed_adds:
-            normalized = self._clean_item_name(item)
-            if not normalized or normalized in player.inventory:
-                continue
-            if not requested_item or not self._matches_known_object(normalized, visible_items + [requested_item]):
-                continue
-            player.inventory.append(normalized)
-            added.append(normalized)
-            self._set_object_state(
+        intent: ActionIntent,
+        check: CheckResult | None,
+        location: Location | None,
+        npc: Npc | None,
+    ) -> tuple[list[str], str]:
+        beat = DirectorBeat(
+            title=intent.title,
+            narration="",
+            mechanical_request=intent.check_kind.value if intent.check_kind is not None else None,
+            tags=list(intent.tags),
+            choices=list(intent.choices),
+        )
+        if check is None:
+            return list(intent.choices[:4]) or self._default_choices(beat), ""
+        follow_up = self._roll_follow_up(intent.raw_input, check.success, beat, location, npc)
+        choices = self._merge_choices(follow_up["choices"], intent.choices)
+        return choices, str(follow_up["prompt"])
+
+    def replay_turn(self, record: TurnRecord, world: World, player: Player) -> None:
+        """Apply a persisted outcome without rerolling or consulting a director."""
+
+        self.state_reducer.apply_accepted(
+            world,
+            player,
+            record.outcome.accepted_effects,
+            lambda effect: self.turn_effects.commit(
+                effect,
+                record.intent,
                 world,
-                player.position,
-                normalized,
-                status="in_inventory",
-                tick=world.tick,
-                owner=player.name,
-            )
-            self._remove_scene_object(world, player.position, normalized)
-        for item in beat.inventory_remove:
-            normalized = self._clean_item_name(item)
-            if normalized in player.inventory:
-                player.inventory.remove(normalized)
-        return added
+                player,
+                CampaignMemory(),
+                self.location_at(world, player.position),
+            ),
+        )
 
     def _requested_take_item(self, action: str) -> str | None:
         words = action.strip().split(maxsplit=1)
@@ -1163,6 +1189,9 @@ class WorldEngine:
             "push",
             "pull",
             "use",
+            "consume",
+            "eat",
+            "drink",
         }:
             return None
         return verb, self._clean_item_name(words[1])
@@ -1236,19 +1265,6 @@ class WorldEngine:
             for obj in objects
             if obj.lower() != item_key and item_key not in obj.lower() and obj.lower() not in item_key
         ]
-
-    def _apply_scene_object_action(self, world: World, position: Position, action: str, visible_items: list[str]) -> list[str]:
-        words = action.strip().split(maxsplit=1)
-        if len(words) != 2 or words[0].lower() not in {"burn", "destroy", "break", "tear", "shatter", "discard"}:
-            return []
-        target = self._clean_item_name(words[1])
-        if not target or not self._matches_known_object(target, visible_items):
-            return []
-        removed = [item for item in visible_items if self._matches_known_object(target, [item])]
-        for item in removed:
-            self._set_object_state(world, position, item, status="destroyed", tick=world.tick)
-        self._remove_scene_object(world, position, target)
-        return removed
 
     def _position_key(self, position: Position) -> str:
         return f"{position.x},{position.y}"
@@ -1609,17 +1625,33 @@ class WorldEngine:
         del world.recent_events[6:]
 
     def _roll_check(self, world: World, player: Player, difficulty: int, check_kind: str | None = None) -> bool:
+        try:
+            kind = CheckKind(check_kind or CheckKind.GENERIC.value)
+        except ValueError:
+            kind = CheckKind.GENERIC
+        return self._resolve_check(world, player, difficulty, kind).success
+
+    def _resolve_check(
+        self,
+        world: World,
+        player: Player,
+        difficulty: int,
+        check_kind: CheckKind,
+    ) -> CheckResult:
         roll = self.random.randint(1, 20)
-        bonus = self.player_bonus(player, check_kind)
+        bonus = self.player_bonus(player, check_kind.value)
         total = roll + bonus
         success = total >= difficulty
-        label = (check_kind or "check").replace("_check", "").title()
-        bonus_text = f"+ {bonus}" if bonus >= 0 else f"- {abs(bonus)}"
-        world.last_roll = (
-            f"Roll: {label} vs DC {difficulty}: raw d20 {roll}, bonus {bonus_text}, total {total} "
-            f"-> {'success' if success else 'failure'}."
+        result = CheckResult(
+            kind=check_kind,
+            difficulty=difficulty,
+            raw_roll=roll,
+            bonus=bonus,
+            total=total,
+            success=success,
         )
-        return success
+        world.last_roll = result.summary
+        return result
 
     def _roll_attack(self, world: World, player: Player, difficulty: int) -> bool:
         return self._roll_check(world, player, difficulty, "combat_check")

@@ -177,12 +177,12 @@ The engine then:
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
 
-The architecture is currently in a phased migration. Phase 4 now represents
-quest stages as typed condition plans, chains generated quests through explicit
-prerequisites, applies structured clock consequences exactly once, and persists
-finale, victory, defeat, abandonment, and epilogue state. Context selection and
-LLM retry/repair contracts remain Phase 5.
-See
+The architecture is currently in a phased migration. Phase 5 now gives each LLM
+task its own prompt and response schema, selects only task-relevant world state,
+enforces a configurable context budget, validates model output, and makes one
+bounded repair request before falling back. See
+[`docs/phase-5-context-contracts.md`](docs/phase-5-context-contracts.md) for the
+runtime contract and budget behavior. See
 [`docs/architecture-audit.md`](docs/architecture-audit.md) for the verified
 baseline findings, ownership model, phase gates, and compatibility risks.
 
@@ -219,6 +219,18 @@ On Windows `cmd.exe`, use `set` instead of `export`. To force the deterministic
 mock instead, set `WORLDSIM_DIRECTOR=mock`. Streaming is enabled by default; set
 `WORLDSIM_LLM_STREAM=0` to use one blocking response.
 
+Director context is capped at an estimated 1,800 tokens by default. The estimate
+uses compact JSON length and a conservative four-characters-per-token ratio.
+Both values and the number of schema repair attempts are configurable:
+
+```bash
+export WORLDSIM_CONTEXT_TOKEN_BUDGET=1800
+export WORLDSIM_CONTEXT_CHARS_PER_TOKEN=4
+export WORLDSIM_LLM_REPAIR_ATTEMPTS=1
+```
+
+Repair attempts are bounded from zero to two. Invalid values use the defaults.
+
 With `llama.cpp`, start `llama-server` with an OpenAI-compatible endpoint first. A typical shape is:
 
 ```bash
@@ -245,13 +257,16 @@ export WORLDSIM_LLM_OUTPUT_COST_PER_1M=14
 export WORLDSIM_LLM_CACHED_INPUT_COST_PER_1M=0.175
 ```
 
-The app sends JSON with:
+The app sends task-specific JSON with:
 
 - `task`: the director operation, such as `generate_world_details`, `describe_location`, or `respond_to_action`
-- `context`: compact world, player, location, NPC, action, memory, hook, and event data
-- `response_schema`: the exact JSON object shape the model must return
+- `context`: a relevance-selected, budgeted view of authoritative state
+- `response_schema`: the exact task-specific JSON object shape the model must return
 
-If the local model is unavailable or returns invalid JSON, the app falls back to `MockDirector` for that beat.
+The director validates both JSON syntax and schema conformance. A malformed
+response gets a bounded repair request containing the validation errors. If the
+server is unavailable or the response remains invalid, the app falls back to
+`MockDirector` for that beat.
 
 ## Memory Model
 
@@ -271,6 +286,8 @@ Each app run writes a new JSONL file under `data/debug`. These logs include:
 - full LLM request payloads sent to `/v1/chat/completions`
 - raw streamed SSE events and assembled text
 - director task prompts and parsed JSON payloads
+- context budget estimates, dropped-item counts, and string truncation counts
+- schema validation repair attempts and repaired responses
 - fallback errors when parsing or model calls fail
 
 The System tab shows the exact debug log path for the current session.
@@ -301,10 +318,12 @@ python -m compileall -q main.py worldsim tests
 ```
 
 The deterministic suite covers the Phase 1 safety boundary, Phase 2 turn
-resolution, Phase 3 scene persistence, and Phase 4 campaign resolution. It
-includes condition-grounded quest completion, irrelevant evidence, dialogue
-recruitment, prerequisite activation, structured clock consequences, finale
-victory/defeat, terminal command gating, replay, and save migration.
+resolution, Phase 3 scene persistence, Phase 4 campaign resolution, and Phase 5
+LLM context contracts. It includes condition-grounded quest completion,
+irrelevant evidence, dialogue recruitment, prerequisite activation, structured
+clock consequences, finale victory/defeat, terminal command gating, replay,
+save migration, unrelated-context exclusion, budget enforcement, and bounded
+schema repair.
 
 When debugging a live LLM turn, compare:
 

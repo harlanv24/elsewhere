@@ -102,3 +102,19 @@ def test_future_save_version_is_rejected(game_state, tmp_path) -> None:
 
     with pytest.raises(UnsupportedSaveVersion, match="newer than supported"):
         store.load()
+
+
+def test_version_one_save_migrates_with_empty_turn_history(game_state, tmp_path) -> None:
+    state = game_state
+    store = CampaignStore(tmp_path / "campaign.json")
+    store.save(state.world, state.player, state.memory)
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 1
+    payload["world"].pop("turn_records")
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = store.load()
+
+    assert loaded is not None
+    migrated_world, _, _ = loaded
+    assert migrated_world.turn_records == []

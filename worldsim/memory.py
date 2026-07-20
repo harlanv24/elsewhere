@@ -7,12 +7,19 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from worldsim.models import (
+    ActionIntent,
+    ActionKind,
     Biome,
+    CheckKind,
+    CheckResult,
     ClockTrigger,
     ClockTriggerKind,
     Condition,
     ConditionKind,
     DialogueState,
+    EffectCondition,
+    EffectKind,
+    EffectSource,
     EncounterState,
     EncounterStatus,
     Event,
@@ -22,13 +29,18 @@ from worldsim.models import (
     Position,
     Quest,
     QuestClock,
+    RejectedEffect,
     SceneState,
+    StateEffect,
+    TurnOutcome,
+    TurnRecord,
     World,
 )
+from worldsim.schemas import turn_record_to_payload
 from worldsim.usage import UsageTotals
 
 
-SAVE_SCHEMA_VERSION = 1
+SAVE_SCHEMA_VERSION = 2
 
 
 class UnsupportedSaveVersion(ValueError):
@@ -251,6 +263,7 @@ class CampaignStore:
             "dialogue_state": asdict(world.dialogue_state) if world.dialogue_state is not None else None,
             "discovered_facts": list(world.discovered_facts),
             "committed_choices": list(world.committed_choices),
+            "turn_records": [turn_record_to_payload(record) for record in world.turn_records],
         }
 
     def _deserialize_world(self, payload: dict[str, object]) -> World:
@@ -322,6 +335,13 @@ class CampaignStore:
             dialogue_state=self._deserialize_dialogue(payload.get("dialogue_state")),
             discovered_facts=list(payload.get("discovered_facts", [])),
             committed_choices=list(payload.get("committed_choices", [])),
+            turn_records=[
+                record
+                for item in payload.get("turn_records", [])
+                if isinstance(item, dict)
+                for record in [self._deserialize_turn_record(item)]
+                if record is not None
+            ],
         )
 
     def _serialize_state(self, world: World, player: Player, memory: CampaignMemory) -> dict[str, object]:
@@ -358,6 +378,7 @@ class CampaignStore:
             "active_scene": self._serialize_scene(world.active_scene),
             "active_encounter": self._serialize_encounter(world.active_encounter),
             "dialogue_state": asdict(world.dialogue_state) if world.dialogue_state is not None else None,
+            "turn_records": [turn_record_to_payload(record) for record in world.turn_records[-12:]],
         }
 
     def _migrate_payload(self, payload: dict[str, object]) -> dict[str, object]:
@@ -371,6 +392,9 @@ class CampaignStore:
         if version == 0:
             payload = self._migrate_v0_to_v1(payload)
             version = 1
+        if version == 1:
+            payload = self._migrate_v1_to_v2(payload)
+            version = 2
         if version != SAVE_SCHEMA_VERSION:
             raise UnsupportedSaveVersion(f"No migration path from campaign save version {version}.")
         return payload
@@ -464,6 +488,14 @@ class CampaignStore:
         payload["schema_version"] = 1
         return payload
 
+    def _migrate_v1_to_v2(self, payload: dict[str, object]) -> dict[str, object]:
+        world = payload.get("world")
+        if not isinstance(world, dict):
+            raise ValueError("Version 1 campaign save must contain a world object.")
+        world.setdefault("turn_records", [])
+        payload["schema_version"] = 2
+        return payload
+
     def _serialize_quest(self, quest: Quest) -> dict[str, object]:
         payload = asdict(quest)
         payload["stage_conditions"] = [
@@ -548,6 +580,105 @@ class CampaignStore:
                 )
             )
         return QuestClock(**raw, triggers=triggers)
+
+    def _deserialize_turn_record(self, payload: dict[str, object]) -> TurnRecord | None:
+        raw_intent = payload.get("intent")
+        raw_outcome = payload.get("outcome")
+        if not isinstance(raw_intent, dict) or not isinstance(raw_outcome, dict):
+            return None
+        try:
+            action_kind = ActionKind(str(raw_intent.get("kind", ActionKind.FREEFORM.value)))
+        except ValueError:
+            action_kind = ActionKind.FREEFORM
+        try:
+            raw_check_kind = raw_intent.get("check_kind")
+            intent_check_kind = CheckKind(str(raw_check_kind)) if raw_check_kind is not None else None
+        except ValueError:
+            intent_check_kind = None
+        intent = ActionIntent(
+            id=str(raw_intent.get("id", payload.get("id", "turn:unknown"))),
+            raw_input=str(raw_intent.get("raw_input", payload.get("command", ""))),
+            kind=action_kind,
+            title=str(raw_intent.get("title", "Improvised Action")),
+            stakes=str(raw_intent.get("stakes", "")),
+            check_kind=intent_check_kind,
+            difficulty=int(raw_intent.get("difficulty", 10)),
+            proposed_effects=[
+                effect
+                for item in raw_intent.get("proposed_effects", [])
+                if isinstance(item, dict)
+                for effect in [self._deserialize_state_effect(item)]
+                if effect is not None
+            ],
+            tags=[item for item in raw_intent.get("tags", []) if isinstance(item, str)],
+            choices=[item for item in raw_intent.get("choices", []) if isinstance(item, str)],
+        )
+
+        check = None
+        raw_check = payload.get("check")
+        if isinstance(raw_check, dict):
+            try:
+                check = CheckResult(
+                    kind=CheckKind(str(raw_check.get("kind"))),
+                    difficulty=int(raw_check.get("difficulty", 10)),
+                    raw_roll=int(raw_check.get("raw_roll", 1)),
+                    bonus=int(raw_check.get("bonus", 0)),
+                    total=int(raw_check.get("total", 1)),
+                    success=bool(raw_check.get("success", False)),
+                )
+            except ValueError:
+                check = None
+
+        accepted = [
+            effect
+            for item in raw_outcome.get("accepted_effects", [])
+            if isinstance(item, dict)
+            for effect in [self._deserialize_state_effect(item)]
+            if effect is not None
+        ]
+        rejected: list[RejectedEffect] = []
+        for item in raw_outcome.get("rejected_effects", []):
+            if not isinstance(item, dict) or not isinstance(item.get("effect"), dict):
+                continue
+            effect = self._deserialize_state_effect(item["effect"])
+            if effect is not None:
+                rejected.append(RejectedEffect(effect=effect, reason=str(item.get("reason", "rejected"))))
+        success = raw_outcome.get("success")
+        outcome = TurnOutcome(
+            success=success if isinstance(success, bool) else None,
+            accepted_effects=accepted,
+            rejected_effects=rejected,
+            authoritative_summary=str(raw_outcome.get("authoritative_summary", "")),
+        )
+        return TurnRecord(
+            id=str(payload.get("id", intent.id)),
+            tick=int(payload.get("tick", 0)),
+            command=str(payload.get("command", intent.raw_input)),
+            intent=intent,
+            check=check,
+            outcome=outcome,
+            narration=str(payload.get("narration", "")),
+            choices=[item for item in payload.get("choices", []) if isinstance(item, str)],
+        )
+
+    def _deserialize_state_effect(self, payload: dict[str, object]) -> StateEffect | None:
+        try:
+            kind = EffectKind(str(payload.get("kind")))
+            condition = EffectCondition(str(payload.get("condition", EffectCondition.SUCCESS.value)))
+            source = EffectSource(str(payload.get("source", EffectSource.DIRECTOR.value)))
+        except ValueError:
+            return None
+        target_id = payload.get("target_id")
+        value = payload.get("value")
+        return StateEffect(
+            kind=kind,
+            target_id=target_id if isinstance(target_id, str) else None,
+            value=value if isinstance(value, str) else None,
+            amount=int(payload.get("amount", 0)),
+            condition=condition,
+            flag=bool(payload.get("flag", False)),
+            source=source,
+        )
 
     def _serialize_scene(self, scene: SceneState | None) -> dict[str, object] | None:
         return asdict(scene) if scene is not None else None

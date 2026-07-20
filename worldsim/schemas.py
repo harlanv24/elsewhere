@@ -3,7 +3,22 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from worldsim.models import DirectorBeat, Location, Npc, Player, Quest, QuestClock, World
+from worldsim.models import (
+    ActionIntent,
+    CheckKind,
+    DirectorBeat,
+    EffectCondition,
+    EffectKind,
+    EffectSource,
+    Location,
+    Npc,
+    Player,
+    Quest,
+    QuestClock,
+    StateEffect,
+    TurnRecord,
+    World,
+)
 
 
 TEXT_RESPONSE_SCHEMA: dict[str, object] = {
@@ -186,6 +201,65 @@ DIRECTOR_BEAT_SCHEMA: dict[str, object] = {
 }
 
 
+ACTION_INTENT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": [
+        "title",
+        "stakes",
+        "check_kind",
+        "difficulty",
+        "tags",
+        "choices",
+        "proposed_effects",
+    ],
+    "properties": {
+        "title": {"type": "string"},
+        "stakes": {"type": "string"},
+        "check_kind": {
+            "type": ["string", "null"],
+            "enum": [kind.value for kind in CheckKind if kind != CheckKind.GENERIC] + [None],
+        },
+        "difficulty": {"type": "integer", "minimum": 1, "maximum": 20},
+        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+        "choices": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+        "proposed_effects": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+                "type": "object",
+                "required": ["kind", "target_id", "value", "amount", "condition", "flag"],
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            kind.value
+                            for kind in EffectKind
+                            if kind
+                            not in {
+                                EffectKind.SCENE_OBJECT_REMOVE,
+                                EffectKind.ENCOUNTER_RESOLVE,
+                                EffectKind.ENCOUNTER_ESCAPE,
+                                EffectKind.ENCOUNTER_START,
+                            }
+                        ],
+                    },
+                    "target_id": {"type": ["string", "null"]},
+                    "value": {"type": ["string", "null"]},
+                    "amount": {"type": "integer", "minimum": -10, "maximum": 10},
+                    "condition": {
+                        "type": "string",
+                        "enum": [condition.value for condition in EffectCondition],
+                    },
+                    "flag": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+
 def director_context(
     world: World,
     player: Player | None = None,
@@ -195,6 +269,7 @@ def director_context(
     action: str | None = None,
     player_dialogue: str | None = None,
     dialogue_history: list[str] | None = None,
+    turn_record: TurnRecord | None = None,
 ) -> dict[str, object]:
     position_key = f"{player.position.x},{player.position.y}" if player is not None else None
     return {
@@ -272,6 +347,7 @@ def director_context(
         "action": action,
         "player_dialogue": player_dialogue,
         "dialogue_history": _compact_lines(dialogue_history or [], 220),
+        "resolved_turn": turn_record_to_payload(turn_record) if turn_record is not None else None,
     }
 
 
@@ -433,6 +509,106 @@ def director_beat_from_payload(payload: dict[str, object]) -> DirectorBeat:
         clock_effects=_clock_effects(payload.get("clock_effects")),
         facts_discovered=_string_list(payload.get("facts_discovered"), 6),
     )
+
+
+def action_intent_from_payload(payload: dict[str, object], intent_id: str, raw_input: str) -> ActionIntent:
+    check_kind_value = payload.get("check_kind")
+    try:
+        check_kind = CheckKind(check_kind_value) if isinstance(check_kind_value, str) else None
+    except ValueError:
+        check_kind = None
+    difficulty = payload.get("difficulty", 10)
+    if not isinstance(difficulty, int):
+        difficulty = 10
+    effects: list[StateEffect] = []
+    for raw_effect in payload.get("proposed_effects", []):
+        if not isinstance(raw_effect, dict):
+            continue
+        try:
+            kind = EffectKind(str(raw_effect.get("kind")))
+            condition = EffectCondition(str(raw_effect.get("condition", EffectCondition.SUCCESS.value)))
+        except ValueError:
+            continue
+        target_id = raw_effect.get("target_id")
+        value = raw_effect.get("value")
+        amount = raw_effect.get("amount", 0)
+        effects.append(
+            StateEffect(
+                kind=kind,
+                target_id=target_id.strip() if isinstance(target_id, str) and target_id.strip() else None,
+                value=value.strip() if isinstance(value, str) and value.strip() else None,
+                amount=max(-10, min(10, amount)) if isinstance(amount, int) else 0,
+                condition=condition,
+                flag=bool(raw_effect.get("flag", False)),
+                source=EffectSource.DIRECTOR,
+            )
+        )
+    return ActionIntent(
+        id=intent_id,
+        raw_input=raw_input,
+        title=_required_string(payload, "title"),
+        stakes=_required_string(payload, "stakes"),
+        check_kind=check_kind,
+        difficulty=max(1, min(20, difficulty)),
+        proposed_effects=effects[:16],
+        tags=_string_list(payload.get("tags"), 8),
+        choices=_string_list(payload.get("choices"), 4),
+    )
+
+
+def turn_record_to_payload(record: TurnRecord) -> dict[str, object]:
+    check = None
+    if record.check is not None:
+        check = {
+            "kind": record.check.kind.value,
+            "difficulty": record.check.difficulty,
+            "raw_roll": record.check.raw_roll,
+            "bonus": record.check.bonus,
+            "total": record.check.total,
+            "success": record.check.success,
+            "summary": record.check.summary,
+        }
+    return {
+        "id": record.id,
+        "tick": record.tick,
+        "command": record.command,
+        "intent": {
+            "id": record.intent.id,
+            "raw_input": record.intent.raw_input,
+            "kind": record.intent.kind.value,
+            "title": record.intent.title,
+            "stakes": record.intent.stakes,
+            "check_kind": record.intent.check_kind.value if record.intent.check_kind is not None else None,
+            "difficulty": record.intent.difficulty,
+            "proposed_effects": [_effect_payload(effect) for effect in record.intent.proposed_effects],
+            "tags": list(record.intent.tags),
+            "choices": list(record.intent.choices),
+        },
+        "check": check,
+        "outcome": {
+            "success": record.outcome.success,
+            "authoritative_summary": record.outcome.authoritative_summary,
+            "accepted_effects": [_effect_payload(effect) for effect in record.outcome.accepted_effects],
+            "rejected_effects": [
+                {"effect": _effect_payload(item.effect), "reason": item.reason}
+                for item in record.outcome.rejected_effects
+            ],
+        },
+        "narration": record.narration,
+        "choices": list(record.choices),
+    }
+
+
+def _effect_payload(effect: StateEffect) -> dict[str, object]:
+    return {
+        "kind": effect.kind.value,
+        "target_id": effect.target_id,
+        "value": effect.value,
+        "amount": effect.amount,
+        "condition": effect.condition.value,
+        "flag": effect.flag,
+        "source": effect.source.value,
+    }
 
 
 def parse_json_object(text: str) -> dict[str, object]:

@@ -526,6 +526,7 @@ def turn_record_to_payload(record: TurnRecord) -> dict[str, object]:
         },
         "narration": record.narration,
         "choices": list(record.choices),
+        "action_graph_after": record.action_graph_after,
     }
 
 

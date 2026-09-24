@@ -6,6 +6,7 @@ import random
 import secrets
 
 from worldsim.director import Director
+from worldsim.action_graph import ActionGraphService, validated_snapshot
 from worldsim.memory import CampaignMemory
 from worldsim.models import (
     ActionIntent,
@@ -45,6 +46,7 @@ class WorldEngine:
         self.turn_effects = TurnEffectService(self)
         self.scene_service = SceneService(self)
         self.navigation = NavigationService()
+        self.action_graphs = ActionGraphService(self)
 
     def create_world(self, director: Director | None = None, theme_prompt: str | None = None) -> World:
         width = 96
@@ -127,6 +129,10 @@ class WorldEngine:
         if campaign_result is not None:
             return campaign_result
 
+        graph_result = self.action_graphs.command(raw_command, world, player, director, memory)
+        if graph_result is not None:
+            return graph_result
+
         if text in {"end conversation", "end dialogue", "goodbye"}:
             if world.dialogue_state is None or not world.dialogue_state.active:
                 return CommandResult("You are not in an active conversation.")
@@ -161,7 +167,9 @@ class WorldEngine:
                 "force exit, talk, say <message>, end conversation, attack, rest, "
                 "wait, inventory, inspect <item>, use <item>, drop <item>, "
                 "take <item>, campaign status, resolve finale, abandon campaign, "
-                "help, quit. Named travel follows the location graph; cardinal "
+                "situation, next situation, choose <action>, try <freeform approach>, help, quit. "
+                "Situations have persistent action branches and recovery paths. "
+                "Named travel follows the location graph; cardinal "
                 "movement explores wilderness tiles. The DM may request "
                 "exploration, social, or combat checks; the engine rolls them "
                 "using class and item bonuses. While speaking with an NPC, bare "
@@ -894,6 +902,9 @@ class WorldEngine:
     ) -> CommandResult:
         if not action:
             return CommandResult("Type a command. Try `help` if you want the list.")
+        graph = self.action_graphs.current(world)
+        if graph is not None and not self.action_graphs.terminal(graph):
+            return self.action_graphs.act(action, world, player, director, memory)
         visible_items = self.scene_objects_at(world, player.position)
         unavailable = self._unavailable_target_message(action, world, player.position, visible_items, player.inventory)
         if unavailable is not None:
@@ -1015,6 +1026,7 @@ class WorldEngine:
     def replay_turn(self, record: TurnRecord, world: World, player: Player) -> None:
         """Apply a persisted outcome without rerolling or consulting a director."""
 
+        graph_after = validated_snapshot(record.action_graph_after) if record.action_graph_after else None
         self.state_reducer.apply_accepted(
             world,
             player,
@@ -1034,6 +1046,8 @@ class WorldEngine:
                 )
             ),
         )
+        if graph_after:
+            world.action_graphs[graph_after["scene_id"]] = graph_after
         world.current_choices = list(record.choices)
         self.scene_service.refresh_actions(world)
 

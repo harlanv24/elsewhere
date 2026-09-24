@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from worldsim import area
@@ -143,7 +144,10 @@ class SceneService:
         scene = world.active_scene
         local = scene is not None and scene.mode == SceneMode.LOCAL
         if local and text == "look":
-            return CommandResult(self.describe(world, self.engine.location_at(world, player.position)))
+            description = self.describe(world, self.engine.location_at(world, player.position))
+            if self.engine.action_graphs.current(world):
+                description += "\n\n" + self.engine.action_graphs.describe(world, player)
+            return CommandResult(description)
 
         area_name = None
         if text.startswith("enter area "):
@@ -361,8 +365,14 @@ class SceneService:
             rejected_effects=rejected,
             authoritative_summary=self.engine.turn_effects.summarize(check, accepted, rejected),
         )
+        graph = None
+        if any(effect.kind == EffectKind.SCENE_ENTER for effect in accepted):
+            graph = self.engine.action_graphs.ensure(world, player, director)
         narration = self._narration(title, check, world, location)
         choices = self.refresh_actions(world)
+        if graph:
+            narration += "\n\n" + self.engine.action_graphs.describe(world, player)
+            choices = self.engine.action_graphs.choices(world, player) + choices
         world.current_choices = list(choices)
         record = TurnRecord(
             id=turn_id,
@@ -373,6 +383,7 @@ class SceneService:
             outcome=outcome,
             narration=narration,
             choices=choices,
+            action_graph_after=deepcopy(graph) if graph else None,
         )
         world.turn_records.append(record)
         del world.turn_records[:-100]

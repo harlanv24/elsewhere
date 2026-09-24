@@ -26,12 +26,14 @@ That keeps the game coherent while still allowing an LLM to improvise.
 - A `MockDirector` that behaves like a local DM
 - A `Director` interface where a real LLM backend can be plugged in later
 - Optional local LLM director using JSON prompts and OpenAI-compatible chat completions
-- Versioned campaign saves with migrations from schema versions 0 through 4
+- Versioned campaign saves with migrations from schema versions 0 through 5
 - Persisted, replayable turn records for freeform and local-scene actions
 - Engine-owned local scenes, depth, tension, hazards, exits, and dialogue state
 - Condition-driven quest stages, prerequisite chains, structured clock triggers,
   finales, victory, defeat, abandonment, and persisted epilogues
 - Deterministic pytest regression coverage for state safety and turn resolution
+- Persistent situation action graphs with roll-based branches, bounded freeform
+  expansion, and engine-validated effects (no Jev access required)
 
 ## Run
 
@@ -62,6 +64,8 @@ python3 main.py
 - `campaign status`
 - `resolve finale`
 - `abandon campaign`
+- `situation` / `next situation`
+- `choose <displayed action>` / `try <freeform approach>`
 
 You can also type freeform actions, such as `take journal`, `read the inscription`,
 or `open the rusted box`. The director proposes a typed intent and effects
@@ -198,6 +202,22 @@ The engine then:
 
 That is the handoff boundary between "LLM as DM" and "code as rules engine."
 
+Local areas now prepare a playable action graph before showing their situation.
+Choose a displayed action or describe an approach; the existing LLM can match it
+to a branch or propose a bounded extension using supported engine operations.
+Failed checks lead to another state, and every active state has a way to set the
+situation aside. Type `situation` to inspect the graph's current options. See
+[`docs/phase-7-action-graphs.md`](docs/phase-7-action-graphs.md) for the commands,
+ownership rules, persistence, current limits, and the optional Jev adapter.
+
+Jev action selection is now optional: set `TYPESAFE_API_KEY` in your environment
+to enable it automatically, or set `WORLDSIM_GRAPH_SELECTOR=llm` to keep selection
+on the existing director. Jev selects bounded actions; the generative director
+still plans situations and narrates outcomes. Uncertain or failed Jev requests
+fall back before any state mutation. Run `python -m worldsim.jev_probe` for a
+single synthetic connectivity/selection check. The initial confidence threshold
+is provisional; see the Phase 7 notes for configuration and evaluation limits.
+
 The architecture is currently in a phased migration. Phase 6 separates named
 travel from wilderness movement with a persisted location graph and replaces
 TUI-owned map logic with deterministic overworld and local-scene compositors.
@@ -318,14 +338,15 @@ The System tab shows the exact debug log path for the current session.
 
 ## Save Schema
 
-`data/campaign.json` now includes `schema_version: 5`. Existing saves without a
-version are treated as version 0; schema versions 1 through 4 are migrated in
+`data/campaign.json` now includes `schema_version: 6`. Existing saves without a
+version are treated as version 0; schema versions 1 through 5 are migrated in
 memory when loaded. The migrations backfill stable location/NPC IDs, structured
 encounters, turn history, local-scene lifecycle fields, typed quest stages,
 campaign status, finale requirements, resolved encounter IDs, and the route
 collection. Version-4 saves start with an empty route collection; the engine
-deterministically regenerates and persists it when the campaign is resumed. The
-next save writes version 5. Saves from a newer unsupported schema fail with an
+deterministically regenerates and persists it when the campaign is resumed.
+Version-5 saves receive an empty situation-graph collection. The
+next save writes version 6. Saves from a newer unsupported schema fail with an
 explicit error instead of being misread.
 
 Both `campaign.json` and the debug `state.json` mirror are written through a
@@ -343,7 +364,7 @@ python -m compileall -q main.py worldsim tests
 
 The deterministic suite covers the Phase 1 safety boundary, Phase 2 turn
 resolution, Phase 3 scene persistence, Phase 4 campaign resolution, Phase 5 LLM
-context contracts, and Phase 6 navigation/rendering. It includes
+context contracts, Phase 6 navigation/rendering, and Phase 7 situation graphs. It includes
 condition-grounded quest completion, irrelevant evidence, dialogue recruitment,
 prerequisite activation, structured clock consequences, finale victory/defeat,
 terminal command gating, replay, save migration, unrelated-context exclusion,

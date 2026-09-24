@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 
+from worldsim.action_graph import PLAN_SCHEMA, DECISION_SCHEMA, EXPANSION_SCHEMA
+
 from worldsim.schemas import (
     ACTION_INTENT_SCHEMA,
     DIRECTOR_BEAT_SCHEMA,
@@ -41,6 +43,32 @@ def _schema(
 
 
 TASK_CONTRACTS: dict[str, TaskContract] = {
+    "plan_action_graph": TaskContract(
+        "plan_action_graph",
+        "Plan a small playable situation BEFORE it is narrated. Use only supplied "
+        "operation IDs and existing entities. Nodes describe narrative situations, "
+        "not extra mechanical effects. Build an acyclic graph with distinct failure "
+        "and success states for checked actions, and equal destinations for unchecked "
+        "actions. Failure must offer a different approach, not a retry loop. Every "
+        "node must be reachable from start. Every nonterminal node needs an action. "
+        "Do not include withdraw operations; the engine supplies exits. Keep to "
+        "eight nodes and eight edges where possible. Never claim unimplemented "
+        "rewards, movement, new items, or quest completion.", PLAN_SCHEMA),
+    "choose_graph_action": TaskContract(
+        "choose_graph_action",
+        "Match the player's action to exactly one available action ID by intent "
+        "and target. Negated, hypothetical, or compound requests must not become "
+        "a single unintended action. Return an empty edge_id and expand=false "
+        "when unclear or unsupported. Use expand=true only for a clear new "
+        "approach achievable through a supplied operation; then edge_id is empty. "
+        "Never choose based merely on keyword overlap.", DECISION_SCHEMA),
+    "expand_action_graph": TaskContract(
+        "expand_action_graph",
+        "Propose one new approach matching the player's request using exactly "
+        "one supplied operation ID. Describe its success and failure without "
+        "inventing entities, resources, mechanical effects, or guaranteed victory. "
+        "The engine owns the roll, effect, and recovery path. This is a proposal, "
+        "not a statement that the player succeeded.", EXPANSION_SCHEMA),
     "introduce_world": TaskContract(
         "introduce_world",
         "Introduce the current campaign in two to five concise sentences. "

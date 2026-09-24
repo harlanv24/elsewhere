@@ -16,6 +16,7 @@ from worldsim.contracts import (
 )
 from worldsim.debug import DebugLogger
 from worldsim.llm_client import LLMClient, LLMClientError
+from worldsim.jev_client import JevClient, JevClientError, JevConfig
 from worldsim.models import (
     ActionIntent,
     CheckKind,
@@ -60,6 +61,35 @@ only what actually happened.
 
 
 class Director(ABC):
+    def plan_action_graph(self, context: dict[str, object]) -> dict | None:
+        """Optional generative planner; None selects the engine's playable template."""
+        return None
+
+    def choose_graph_action(self, context: dict[str, object]) -> dict | None:
+        """Typed selection boundary shared by Jev and generative interpreters.
+
+        The offline director only recognizes exact operation text. No keyword
+        guessing: uncertain freeform input must never commit an unintended action.
+        """
+        action = str(context.get("action", "")).strip().casefold()
+        operations = {op["id"]: op for op in context.get("operations", [])}
+        for edge in context.get("available_actions", []):
+            operation = operations.get(edge["operation_id"])
+            if operation and action == operation["action"].casefold():
+                return {"edge_id": edge["id"], "expand": False}
+        if any(action == op["action"].casefold() and op["id"] != "withdraw" for op in operations.values()):
+            return {"edge_id": "", "expand": True}
+        return None
+
+    def expand_action_graph(self, context: dict[str, object]) -> dict | None:
+        action = str(context.get("action", "")).strip().casefold()
+        for operation in context.get("operations", []):
+            if action == operation["action"].casefold() and operation["id"] != "withdraw":
+                return {"label": operation["label"], "operation_id": operation["id"],
+                        "success_description": f"Your attempt to {operation['action']} is resolved.",
+                        "failure_description": "That approach failed; take time to reassess or set the situation aside."}
+        return None
+
     @abstractmethod
     def introduce_world(self, world: World, player: Player, memory_context: list[str] | None = None) -> str:
         raise NotImplementedError
@@ -363,6 +393,36 @@ class MockDirector(Director):
 class LocalLLMDirector(Director):
     """Director backed by a local OpenAI-compatible chat completions server."""
 
+    def _graph_request(self, task: str, context: dict[str, object]) -> dict | None:
+        try:
+            # Preserve exact capability IDs. Reject oversize input rather than
+            # silently trimming an action's grounding or its prerequisites.
+            if self.context_selector.estimate_tokens(context) > self.context_selector.budget.max_estimated_tokens:
+                raise ValueError("Action graph context exceeds the configured budget.")
+            return self._request_json(task, context)
+        except (LLMClientError, ValueError, json.JSONDecodeError) as exc:
+            self._record_fallback(task, exc)
+            return getattr(self.fallback, task)(context)
+
+    def plan_action_graph(self, context: dict[str, object]) -> dict | None:
+        return self._graph_request("plan_action_graph", context)
+
+    def choose_graph_action(self, context: dict[str, object]) -> dict | None:
+        if self.graph_selector is not None:
+            try:
+                decision = self.graph_selector.choose_graph_action(context)
+                self._log("jev_selection", status=self.graph_selector.last_status,
+                          confidence=self.graph_selector.last_confidence,
+                          model=self.graph_selector.last_model)
+                if decision is not None:
+                    return decision
+            except JevClientError as exc:
+                self._log("jev_fallback", error=str(exc))
+        return self._graph_request("choose_graph_action", context)
+
+    def expand_action_graph(self, context: dict[str, object]) -> dict | None:
+        return self._graph_request("expand_action_graph", context)
+
     def __init__(
         self,
         client: LLMClient,
@@ -370,8 +430,10 @@ class LocalLLMDirector(Director):
         debug_logger: DebugLogger | None = None,
         context_selector: ContextSelector | None = None,
         repair_attempts: int | None = None,
+        graph_selector: JevClient | None = None,
     ) -> None:
         self.client = client
+        self.graph_selector = graph_selector
         self.fallback = fallback
         self.debug_logger = debug_logger
         self.context_selector = context_selector or ContextSelector()
@@ -397,8 +459,14 @@ class LocalLLMDirector(Director):
     @property
     def status_line(self) -> str:
         config = self.client.config
+        jev = (
+            f" | Jev: {self.graph_selector.last_status}, "
+            f"{self.graph_selector.requests} requests, "
+            f"{self.graph_selector.input_tokens + self.graph_selector.output_tokens} tokens"
+            if self.graph_selector is not None else ""
+        )
         if self.last_error:
-            return f"LLM director: fallback after {self.last_task or 'request'} failed ({self.last_error})"
+            return f"LLM director: fallback after {self.last_task or 'request'} failed ({self.last_error}){jev}"
         auth = "API key present" if config.api_key else "no API key"
         context = (
             f", context {self.last_context_metrics.estimated_tokens}/"
@@ -406,7 +474,7 @@ class LocalLLMDirector(Director):
             if self.last_context_metrics is not None
             else ""
         )
-        return f"LLM director: {config.model} at {config.base_url} ({auth}{context})"
+        return f"LLM director: {config.model} at {config.base_url} ({auth}{context}){jev}"
 
     def introduce_world(self, world: World, player: Player, memory_context: list[str] | None = None) -> str:
         try:
@@ -762,7 +830,11 @@ def director_from_env(seed: int, debug_logger: DebugLogger | None = None) -> Dir
     fallback = MockDirector(seed)
     if os.getenv("WORLDSIM_DIRECTOR", "llm").lower() != "llm":
         return fallback
-    return LocalLLMDirector(LLMClient.from_env(debug_logger), fallback, debug_logger)
+    selector = os.getenv("WORLDSIM_GRAPH_SELECTOR", "auto").lower()
+    if selector not in {"auto", "llm", "jev"}:
+        raise ValueError("WORLDSIM_GRAPH_SELECTOR must be auto, llm, or jev.")
+    jev = JevClient(JevConfig.from_env()) if selector == "jev" or (selector == "auto" and os.getenv("TYPESAFE_API_KEY")) else None
+    return LocalLLMDirector(LLMClient.from_env(debug_logger), fallback, debug_logger, graph_selector=jev)
 
 
 def _intent_from_beat(intent_id: str, action: str, beat: DirectorBeat, world: World) -> ActionIntent:

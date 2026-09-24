@@ -442,6 +442,8 @@ class TurnRecord:
     outcome: TurnOutcome
     narration: str
     choices: list[str] = field(default_factory=list)
+    # Full validated snapshot makes generated branches replayable without AI.
+    action_graph_after: dict[str, object] | None = None
 
 
 @dataclass
@@ -517,6 +519,7 @@ class World:
     ending_reason: str | None = None
     turn_records: list[TurnRecord] = field(default_factory=list)
     routes: list[LocationRoute] = field(default_factory=list)
+    action_graphs: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass

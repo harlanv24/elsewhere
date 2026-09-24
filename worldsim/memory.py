@@ -5,6 +5,9 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from copy import deepcopy
+
+from worldsim.action_graph import validated_snapshot
 
 from worldsim.models import (
     ActionIntent,
@@ -47,7 +50,7 @@ from worldsim.schemas import turn_record_to_payload
 from worldsim.usage import UsageTotals
 
 
-SAVE_SCHEMA_VERSION = 5
+SAVE_SCHEMA_VERSION = 6
 
 
 class UnsupportedSaveVersion(ValueError):
@@ -295,6 +298,7 @@ class CampaignStore:
             "committed_choices": list(world.committed_choices),
             "resolved_encounter_ids": list(world.resolved_encounter_ids),
             "turn_records": [turn_record_to_payload(record) for record in world.turn_records],
+            "action_graphs": deepcopy(world.action_graphs),
         }
 
     def _deserialize_world(self, payload: dict[str, object]) -> World:
@@ -405,6 +409,7 @@ class CampaignStore:
             discovered_facts=list(payload.get("discovered_facts", [])),
             committed_choices=list(payload.get("committed_choices", [])),
             resolved_encounter_ids=list(payload.get("resolved_encounter_ids", [])),
+            action_graphs={key: validated_snapshot(graph) for key, graph in payload.get("action_graphs", {}).items()},
             turn_records=[
                 record
                 for item in payload.get("turn_records", [])
@@ -469,6 +474,7 @@ class CampaignStore:
             "dialogue_state": asdict(world.dialogue_state) if world.dialogue_state is not None else None,
             "resolved_encounter_ids": list(world.resolved_encounter_ids),
             "turn_records": [turn_record_to_payload(record) for record in world.turn_records[-12:]],
+            "action_graphs": deepcopy(world.action_graphs),
         }
 
     def _migrate_payload(self, payload: dict[str, object]) -> dict[str, object]:
@@ -494,6 +500,11 @@ class CampaignStore:
         if version == 4:
             payload = self._migrate_v4_to_v5(payload)
             version = 5
+        if version == 5:
+            payload = deepcopy(payload)
+            payload["world"].setdefault("action_graphs", {})
+            payload["schema_version"] = 6
+            version = 6
         if version != SAVE_SCHEMA_VERSION:
             raise UnsupportedSaveVersion(f"No migration path from campaign save version {version}.")
         return payload
@@ -1007,6 +1018,8 @@ class CampaignStore:
             outcome=outcome,
             narration=str(payload.get("narration", "")),
             choices=[item for item in payload.get("choices", []) if isinstance(item, str)],
+            action_graph_after=validated_snapshot(payload["action_graph_after"])
+            if payload.get("action_graph_after") is not None else None,
         )
 
     def _deserialize_state_effect(self, payload: dict[str, object]) -> StateEffect | None:

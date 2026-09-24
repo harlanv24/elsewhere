@@ -11,6 +11,8 @@ GLOBAL_COMMANDS = {
     "end conversation",
     "end dialogue",
     "goodbye",
+    "situation",
+    "next situation",
 }
 
 
@@ -22,6 +24,6 @@ def normalize_command_input(entered: str, dialogue_active: bool) -> str:
         return ""
     if cleaned.startswith("/"):
         return cleaned[1:].strip()
-    if dialogue_active and cleaned.casefold() not in GLOBAL_COMMANDS:
+    if dialogue_active and cleaned.casefold() not in GLOBAL_COMMANDS and not cleaned.casefold().startswith(("choose ", "try ")):
         return f"say {cleaned}"
     return cleaned

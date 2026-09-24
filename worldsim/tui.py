@@ -2036,6 +2036,13 @@ class WorldSimApp(App[None]):
 
     def _visible_choice_labels(self, location: Location | None) -> list[str]:
         assert self.session is not None
+        graph_choices = self.engine.action_graphs.choices(self.session.world, self.session.player)
+        if graph_choices:
+            # Keep the guaranteed exit visible even when a generated node has
+            # more actions than the four-button presentation can display.
+            exit_choice = "choose Set this situation aside"
+            primary = [choice for choice in graph_choices if choice != exit_choice]
+            return primary[:3] + ([exit_choice] if exit_choice in graph_choices else [])
         scene = self.session.world.active_scene
         if scene is None or scene.mode != SceneMode.LOCAL:
             visible = self._scene_object_choice_labels(location)
